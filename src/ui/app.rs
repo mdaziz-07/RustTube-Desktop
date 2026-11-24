@@ -1056,6 +1056,7 @@ impl AppView {
         if route == self.route {
             // re-navigating to the same place refreshes it (like clicking Home again)
             if !matches!(route, Route::Watch { .. }) {
+                crate::ui::pages::home::clear_home_cache();
                 self.page = build_page(&route, window, cx);
                 cx.notify();
             }
@@ -1400,6 +1401,7 @@ impl AppView {
     /// Reloads the current page (the watch page keeps the player going).
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.set_global(OpenMenu(None));
+        crate::ui::pages::home::clear_home_cache();
         if let Route::Watch { id, playlist, .. } = self.route.clone() {
             let t = player(cx).read(cx).time;
             self.route = Route::Watch { id, playlist, start: Some(t) };

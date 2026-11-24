@@ -247,7 +247,7 @@ fn parse_video_renderer(r: &Value) -> Option<VideoItem> {
 }
 
 pub fn default_thumb(id: &str) -> String {
-    format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg")
+    format!("https://i.ytimg.com/vi/{id}/hq720.jpg")
 }
 
 fn parse_reel_item(r: &Value) -> Option<VideoItem> {

@@ -99,6 +99,8 @@ pub fn apply_theme(window: Option<&mut Window>, cx: &mut App) {
     t.caret = p.accent;
     t.ring = p.accent;
     t.selection = p.accent.opacity(0.35);
+    t.link = p.link;
+    t.link_hover = p.link;
     cx.refresh_windows();
 }
 

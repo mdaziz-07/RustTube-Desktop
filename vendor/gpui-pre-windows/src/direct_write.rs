@@ -677,10 +677,15 @@ impl DirectWriteState {
             )?;
         }
         // We rasterize into bitmaps, which outline rendering can't produce.
+        // GDI modes apply harsh pixel snapping and low-res hinting, making fonts thin and jagged.
+        // DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC with grid fitting disabled produces clean, crisp, smooth typography.
         let rendering_mode = match rendering_mode {
-            DWRITE_RENDERING_MODE1_OUTLINE => DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
+            DWRITE_RENDERING_MODE1_OUTLINE
+            | DWRITE_RENDERING_MODE1_GDI_CLASSIC
+            | DWRITE_RENDERING_MODE1_GDI_NATURAL => DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
             mode => mode,
         };
+        let grid_fit_mode = DWRITE_GRID_FIT_MODE_DISABLED;
         Ok((rendering_mode, grid_fit_mode))
     }
 
@@ -1745,25 +1750,23 @@ fn get_system_subpixel_rendering() -> bool {
 
 fn get_system_ui_font_name() -> SharedString {
     unsafe {
-        let mut info: LOGFONTW = std::mem::zeroed();
-        let font_family = if SystemParametersInfoW(
-            SPI_GETICONTITLELOGFONT,
-            std::mem::size_of::<LOGFONTW>() as u32,
-            Some(&mut info as *mut _ as _),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        )
-        .log_err()
-        .is_none()
-        {
-            // https://learn.microsoft.com/en-us/windows/win32/uxguide/vis-fonts
-            // Segoe UI is the Windows font intended for user interface text strings.
-            "Segoe UI".into()
-        } else {
-            let font_name = String::from_utf16_lossy(&info.lfFaceName);
-            font_name.trim_matches(char::from(0)).to_owned().into()
-        };
-        log::info!("Use {} as UI font.", font_family);
-        font_family
+        let factory: Result<IDWriteFactory5> = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED);
+        if let Ok(f) = factory {
+            let mut coll = None;
+            if f.GetSystemFontCollection(false, &mut coll, false).is_ok() {
+                if let Some(c) = coll {
+                    let mut index = 0;
+                    let mut exists = BOOL::default();
+                    let test_name = HSTRING::from("Segoe UI Variable Text");
+                    if c.FindFamilyName(&test_name, &mut index, &mut exists).is_ok() && exists.as_bool() {
+                        log::info!("Use Segoe UI Variable Text as UI font.");
+                        return "Segoe UI Variable Text".into();
+                    }
+                }
+            }
+        }
+        log::info!("Use Segoe UI as UI font.");
+        "Segoe UI".into()
     }
 }
 

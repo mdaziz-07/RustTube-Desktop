@@ -112,13 +112,10 @@ pub fn best_thumb(v: &Value) -> Option<String> {
         .and_then(Value::as_array)?;
     let w = |t: &&Value| t.get("width").and_then(Value::as_u64).unwrap_or(0);
     let h = |t: &&Value| t.get("height").and_then(Value::as_u64).unwrap_or(0);
-    // big enough for a card on a high-DPI screen, and no bigger: every image is
-    // kept decoded in memory (portrait Shorts covers count by height)
+    // Pick the highest quality thumbnail available
     let best = arr
         .iter()
-        .filter(|t| w(t) >= 600 || h(t) >= 700)
-        .min_by_key(|t| w(t) * h(t).max(1))
-        .or_else(|| arr.iter().max_by_key(w))?;
+        .max_by_key(|t| w(t) * h(t).max(1))?;
     best.get("url").and_then(Value::as_str).map(fix_url).map(|u| limit_avatar(&u))
 }
 

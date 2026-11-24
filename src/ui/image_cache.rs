@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 /// Web images are decoded no larger than this (Shorts covers come as 1080x1920,
 /// but are never drawn that big); every image stays decoded in memory.
-const MAX_W: u32 = 1280;
-const MAX_H: u32 = 720;
+const MAX_W: u32 = 1920;
+const MAX_H: u32 = 1080;
 
 type LoadResult = Result<Arc<RenderImage>, ImageCacheError>;
 
@@ -88,7 +88,7 @@ fn fetch_decode(url: &str) -> anyhow::Result<Arc<RenderImage>> {
     let mut rgba = if w > MAX_W || h > MAX_H {
         let k = (MAX_W as f32 / w as f32).min(MAX_H as f32 / h as f32);
         let (nw, nh) = (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1));
-        image::imageops::resize(&img.into_rgba8(), nw, nh, image::imageops::FilterType::Triangle)
+        image::imageops::resize(&img.into_rgba8(), nw, nh, image::imageops::FilterType::CatmullRom)
     } else {
         img.into_rgba8()
     };

@@ -27,7 +27,7 @@ impl<T> Load<T> {
 pub fn page_scroll(id: &'static str, handle: &ScrollHandle) -> PageScroll {
     ACTIVE_PAGE.with(|a| *a.borrow_mut() = Some((id, handle.clone())));
     PageScroll {
-        inner: div().id(id).size_full().overflow_y_scroll().track_scroll(handle).child(smooth_scroll(id, handle.clone())),
+        inner: div().id(id).size_full().overflow_y_scroll().track_scroll(handle),
         handle: handle.clone(),
     }
 }
@@ -61,25 +61,12 @@ impl RenderOnce for PageScroll {
 thread_local! {
     /// the page scroll area drawn last, which is the page on screen
     static ACTIVE_PAGE: std::cell::RefCell<Option<(&'static str, ScrollHandle)>> = const { std::cell::RefCell::new(None) };
-    static GLIDES: std::cell::RefCell<std::collections::HashMap<&'static str, Glide>> = Default::default();
-}
-
-struct Glide {
-    /// where the page is drawn now / where it's heading (offset.y, <= 0)
-    shown: f32,
-    target: f32,
-    last: std::time::Instant,
-    /// the last wheel event came from a touchpad
-    precise: bool,
-    /// a mouse wheel moved the page since the last frame (anything else that
-    /// moves it, like dragging the scrollbar, is followed exactly)
-    wheel: bool,
 }
 
 /// Scrolls the page on screen for PageUp/PageDown, Home/End, the arrow keys and
 /// Space / Shift+Space. Returns false when the key isn't a scrolling key.
 pub fn scroll_page_key(key: &str, shift: bool, window: &mut Window) -> bool {
-    let Some((id, handle)) = ACTIVE_PAGE.with(|a| a.borrow().clone()) else { return false };
+    let Some((_id, handle)) = ACTIVE_PAGE.with(|a| a.borrow().clone()) else { return false };
     let view: f32 = handle.bounds().size.height.into();
     let max: f32 = handle.max_offset().y.into();
     let page = (view * 0.85).max(100.0);
@@ -93,77 +80,10 @@ pub fn scroll_page_key(key: &str, shift: bool, window: &mut Window) -> bool {
         _ => return false,
     };
     let now: f32 = handle.offset().y.into();
-    GLIDES.with(|g| {
-        let mut g = g.borrow_mut();
-        let st = g.entry(id).or_insert(Glide { shown: now, target: now, last: std::time::Instant::now(), precise: false, wheel: false });
-        // from where it's already heading, so repeated presses add up
-        let from = if (st.target - now).abs() > 0.5 && !st.precise { st.target } else { now };
-        st.precise = false;
-        st.target = (from + delta).clamp(-max.max(0.0), 0.0);
-        st.shown = now;
-        st.last = std::time::Instant::now();
-    });
+    let target = (now + delta).clamp(-max.max(0.0), 0.0);
+    handle.set_offset(point(handle.offset().x, px(target)));
     window.refresh();
     true
-}
-
-/// Mouse-wheel scrolling that glides instead of jumping a fixed step per notch.
-/// gpui moves the page by the whole step; this notices the jump, keeps it as the
-/// target and eases the visible position there over the next frames. Touchpad
-/// scrolling is already smooth and passes through untouched.
-fn smooth_scroll(id: &'static str, handle: ScrollHandle) -> impl IntoElement {
-    /// how quickly it settles: ~63% of the way every TAU
-    const TAU: f32 = 0.045;
-    /// mouse-wheel notches move a bit further than gpui's line step
-    const WHEEL_BOOST: f32 = 1.4;
-    canvas(
-        move |_, window, _| {
-            let now = std::time::Instant::now();
-            let actual: f32 = handle.offset().y.into();
-            let max: f32 = handle.max_offset().y.into();
-            GLIDES.with(|g| {
-                let mut g = g.borrow_mut();
-                let st = g.entry(id).or_insert(Glide { shown: actual, target: actual, last: now, precise: false, wheel: false });
-                let wheel = std::mem::take(&mut st.wheel);
-                let moved = actual - st.shown;
-                if moved.abs() > 0.01 {
-                    // something moved the page since the last frame
-                    if st.precise || !wheel || moved.abs() > 3000.0 {
-                        // touchpad, the scrollbar, or a jump (new page, scroll to top): follow it exactly
-                        *st = Glide { shown: actual, target: actual, last: now, precise: st.precise, wheel: false };
-                        return;
-                    }
-                    st.target = (st.target + moved * WHEEL_BOOST).clamp(-max.max(0.0), 0.0);
-                }
-                let gap = st.target - st.shown;
-                if gap.abs() < 0.5 {
-                    st.shown = st.target;
-                } else {
-                    let dt = now.duration_since(st.last).as_secs_f32().min(0.05);
-                    st.shown += gap * (1.0 - (-dt / TAU).exp());
-                    window.request_animation_frame();
-                }
-                st.last = now;
-                if (st.shown - actual).abs() > 0.01 {
-                    handle.set_offset(point(handle.offset().x, px(st.shown)));
-                }
-            });
-        },
-        move |_, _, window, _| {
-            window.on_mouse_event(move |ev: &ScrollEvent, phase, _, _| {
-                if phase == DispatchPhase::Capture {
-                    GLIDES.with(|g| {
-                        if let Some(st) = g.borrow_mut().get_mut(id) {
-                            st.precise = ev.delta.precise();
-                            st.wheel = true;
-                        }
-                    });
-                }
-            });
-        },
-    )
-    .absolute()
-    .size_0()
 }
 
 /// A scroll area inside a page (queue, chat, chapters). gpui hands a wheel event
@@ -238,11 +158,16 @@ pub(crate) fn tokenize(text: &str) -> Vec<(std::ops::Range<usize>, Token)> {
     while i < text.len() {
         let rest = &text[i..];
         let at_word_start = i == 0 || !text[..i].chars().last().map(|c| c.is_alphanumeric()).unwrap_or(false);
-        if rest.starts_with("http://") || rest.starts_with("https://") {
+        if at_word_start && (rest.starts_with("http://") || rest.starts_with("https://") || rest.starts_with("www.") || rest.starts_with("youtube.com/") || rest.starts_with("youtu.be/")) {
             let end = rest.find(|c: char| c.is_whitespace() || c == ')' || c == '"').unwrap_or(rest.len());
-            let url = rest[..end].trim_end_matches(['.', ',', '!', '?']).to_string();
-            out.push((i..i + url.len(), Token::Url(url.clone())));
-            i += url.len().max(1);
+            let raw_url = rest[..end].trim_end_matches(['.', ',', '!', '?']).to_string();
+            let url = if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
+                raw_url.clone()
+            } else {
+                format!("https://{raw_url}")
+            };
+            out.push((i..i + raw_url.len(), Token::Url(url)));
+            i += raw_url.len().max(1);
             continue;
         }
         if at_word_start && bytes[i].is_ascii_digit() {
@@ -266,6 +191,24 @@ pub(crate) fn tokenize(text: &str) -> Vec<(std::ops::Range<usize>, Token)> {
                 let tok = if bytes[i] == b'#' { Token::Hashtag(word.to_string()) } else { Token::Handle(word.to_string()) };
                 out.push((i..i + word.len(), tok));
                 i += word.len();
+                continue;
+            }
+        }
+        if at_word_start && bytes[i] == b'/' && rest.len() > 1 {
+            // Channel link in description/comments formatted as "/ channelname", "/channelname", "/@handle", etc.
+            let after_slash = &rest[1..];
+            let trimmed = after_slash.trim_start();
+            let spaces = after_slash.len() - trimmed.len();
+            let cand = trimmed.strip_prefix('@').unwrap_or(trimmed);
+            let end = cand
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-' || c == '.'))
+                .unwrap_or(cand.len());
+            let name = cand[..end].trim_end_matches(['.', ',', '!', '?', ';', ':']);
+            if name.len() >= 2 && name.chars().any(|c| c.is_alphabetic()) {
+                let full_span_len = 1 + spaces + (trimmed.len() - cand.len()) + name.len();
+                let handle = if trimmed.starts_with('@') { format!("@{name}") } else { name.to_string() };
+                out.push((i..i + full_span_len, Token::Handle(handle)));
+                i += full_span_len;
                 continue;
             }
         }
@@ -326,9 +269,16 @@ fn open_link(url: &str, window: &mut Window, cx: &mut App) {
     } else if let Some(h) = url.strip_prefix("st-tag:") {
         crate::ui::app::navigate(crate::ui::app::Route::Search(crate::api::http::urldecode(h)), window, cx);
     } else if let Some(h) = url.strip_prefix("st-handle:") {
-        let url = format!("https://www.youtube.com/{}", crate::api::http::urldecode(h));
+        let raw = crate::api::http::urldecode(h);
+        let clean = raw.trim_start_matches('@').trim_start_matches('/').trim().to_string();
         cx.spawn(async move |cx| {
-            if let Ok(crate::api::innertube::ResolvedUrl::Channel(id)) = blocking(move || crate::api::innertube::resolve_url(&url)).await {
+            let url1 = format!("https://www.youtube.com/@{clean}");
+            let url2 = format!("https://www.youtube.com/{clean}");
+            let res = blocking(move || {
+                crate::api::innertube::resolve_url(&url1)
+                    .or_else(|_| crate::api::innertube::resolve_url(&url2))
+            }).await;
+            if let Ok(crate::api::innertube::ResolvedUrl::Channel(id)) = res {
                 let _ = cx.update(|cx| {
                     if let Some(w) = cx.active_window() {
                         let _ = w.update(cx, |_, window, cx| crate::ui::app::navigate(crate::ui::app::Route::Channel(id), window, cx));

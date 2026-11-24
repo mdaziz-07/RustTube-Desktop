@@ -1186,6 +1186,7 @@ impl Render for SettingsPage {
                     .child(name.to_string())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.section = sec;
+                        this.scroll.set_offset(point(px(0.), px(0.)));
                         cx.notify();
                     })),
             );
@@ -1211,11 +1212,28 @@ impl Render for SettingsPage {
                 all = all.child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(p.text2).child(name.to_uppercase())).child(render_section(self, *sec, cx));
             }
             QUERY.with(|q| q.borrow_mut().clear());
-            return page_scroll("settings-scroll", &self.scroll).child(
-                div().flex().justify_center().gap_8().px_6().pt_6().pb_24().child(nav).child(
-                    div().flex().flex_col().gap_4().flex_1().max_w(px(860.)).min_w_0().child(section_title(&format!("Results for “{query}”"), cx).text_2xl()).child(all),
-                ),
-            );
+            return div()
+                .size_full()
+                .flex()
+                .justify_center()
+                .gap_8()
+                .px_6()
+                .pt_6()
+                .child(nav)
+                .child(
+                    page_scroll("settings-scroll", &self.scroll).child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .flex_1()
+                            .max_w(px(860.))
+                            .min_w_0()
+                            .pb_24()
+                            .child(section_title(&format!("Results for “{query}”"), cx).text_2xl())
+                            .child(all),
+                    ),
+                );
         }
         let content = match self.section {
             Section::General => self.general(cx),
@@ -1232,18 +1250,28 @@ impl Render for SettingsPage {
             Section::About => self.about(cx),
         };
         let title = SECTIONS.iter().find(|s| s.0 == self.section).map(|s| s.1).unwrap_or("");
-        page_scroll("settings-scroll", &self.scroll).child(
-            div().flex().justify_center().gap_8().px_6().pt_6().pb_24().child(nav).child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_4()
-                    .flex_1().max_w(px(860.))
-                    .min_w_0()
-                    .child(section_title(title, cx).text_2xl())
-                    .child(content),
-            ),
-        )
+        div()
+            .size_full()
+            .flex()
+            .justify_center()
+            .gap_8()
+            .px_6()
+            .pt_6()
+            .child(nav)
+            .child(
+                page_scroll("settings-scroll", &self.scroll).child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .flex_1()
+                        .max_w(px(860.))
+                        .min_w_0()
+                        .pb_24()
+                        .child(section_title(title, cx).text_2xl())
+                        .child(content),
+                ),
+            )
     }
 }
 
