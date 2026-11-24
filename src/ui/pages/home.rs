@@ -136,7 +136,8 @@ struct HomeCacheEntry {
     continuation: Option<String>,
 }
 
-static HOME_CACHE: parking_lot::Mutex<std::collections::HashMap<usize, HomeCacheEntry>> = parking_lot::Mutex::new(std::collections::HashMap::new());
+static HOME_CACHE: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<usize, HomeCacheEntry>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
 /// Clears cached home feed so the next visit reloads from network (e.g. when reload icon is tapped).
 pub fn clear_home_cache() {
