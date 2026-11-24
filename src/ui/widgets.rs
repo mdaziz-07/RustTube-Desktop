@@ -421,19 +421,32 @@ pub fn comment_body(id: impl Into<SharedString>, c: &crate::api::types::Comment,
 
 #[cfg(test)]
 mod clamp_tests {
-    use super::clamp_text;
+    use super::{clamp_text, tokenize, Token};
     #[test]
     fn clamps() {
         assert_eq!(clamp_text("short", 5, 400), None);
-        assert_eq!(clamp_text("a
-b
-c", 2, 400).as_deref(), Some("a
-b…"));
+        assert_eq!(clamp_text("a\nb\nc", 2, 400).as_deref(), Some("a\nb…"));
         let long = "word ".repeat(200);
         let c = clamp_text(&long, 5, 400).unwrap();
         assert!(c.chars().count() <= 401 && c.ends_with("word…"));
         // multi-byte text is cut on a char boundary
         assert!(clamp_text(&"é".repeat(500), 5, 400).is_some());
+    }
+
+    #[test]
+    fn tokenizes_handles_and_channels() {
+        let text = "Click here to subscribe: / sonyliv and @youtube";
+        let tokens = tokenize(text);
+        let handles: Vec<_> = tokens
+            .into_iter()
+            .filter_map(|(r, t)| match t {
+                Token::Handle(h) => Some((&text[r], h)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(handles.len(), 2);
+        assert_eq!(handles[0].1, "sonyliv");
+        assert_eq!(handles[1].1, "@youtube");
     }
 }
 

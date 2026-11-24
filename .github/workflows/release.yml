@@ -46,10 +46,6 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-  linux:
-    needs: check
-    uses: ./.github/workflows/linux.yml
-
   windows:
     needs: check
     uses: ./.github/workflows/windows.yml
@@ -57,7 +53,7 @@ jobs:
       package: true
 
   publish:
-    needs: [check, linux, windows]
+    needs: [check, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write       # create the draft release and upload its files
