@@ -9,6 +9,10 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const REPO: &str = "Avaneesh-Inamdar/Stream-Tube-Desktop";
+/// Where release files may come from. The project is moving to the StreamTubeProject
+/// organization; once it has, GitHub serves the files from there, so versions from
+/// before the move have to accept both places to keep updating.
+const RELEASE_REPOS: [&str; 2] = [REPO, "StreamTubeProject/Stream-Tube-Desktop"];
 pub const RELEASES_PAGE: &str = "https://github.com/Avaneesh-Inamdar/Stream-Tube-Desktop/releases";
 
 #[derive(Clone, Debug)]
@@ -98,7 +102,8 @@ fn pick_asset(assets: &[Value]) -> Option<Asset> {
         let url = a.get("browser_download_url")?.as_str()?;
         // only files of this project's releases, saved under a plain file name
         let plain = !name.is_empty() && !name.contains(['/', '\\', ':']) && !name.starts_with('.');
-        if !plain || !url.starts_with(&format!("https://github.com/{REPO}/releases/download/")) {
+        let ours = RELEASE_REPOS.iter().any(|repo| url.starts_with(&format!("https://github.com/{repo}/releases/download/")));
+        if !plain || !ours {
             return None;
         }
         let sha256 = a
@@ -322,5 +327,9 @@ mod tests {
         // another repository, or a name that is a path
         assert!(pick_asset(&[asset(&good, &format!("https://github.com/someone/else/releases/download/v1.0.0/{good}"))]).is_none());
         assert!(pick_asset(&[asset(&format!("..\\{good}"), &format!("https://github.com/{}/releases/download/v1.0.0/x", super::REPO))]).is_none());
+        // the organization the project is moving to, but not names that only start the same
+        assert!(pick_asset(&[asset(&good, &format!("https://github.com/StreamTubeProject/Stream-Tube-Desktop/releases/download/v1.0.0/{good}"))]).is_some());
+        assert!(pick_asset(&[asset(&good, &format!("https://github.com/StreamTubeProject/Stream-Tube-Desktop-fork/releases/download/v1.0.0/{good}"))]).is_none());
+        assert!(pick_asset(&[asset(&good, &format!("https://github.com/StreamTubeProjectX/Stream-Tube-Desktop/releases/download/v1.0.0/{good}"))]).is_none());
     }
 }

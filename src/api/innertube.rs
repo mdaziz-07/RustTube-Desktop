@@ -84,7 +84,7 @@ fn walk_items(v: &Value, page: &mut Page) {
                             page.items.push(Item::Channel(ch));
                         }
                     }
-                    "playlistRenderer" | "gridPlaylistRenderer" | "radioRenderer" | "compactPlaylistRenderer" => {
+                    "playlistRenderer" | "gridPlaylistRenderer" | "radioRenderer" | "compactPlaylistRenderer" | "gridShowRenderer" => {
                         if let Some(p) = parse_playlist_renderer(c) {
                             page.items.push(Item::Playlist(p));
                         }
@@ -473,12 +473,18 @@ fn parse_channel_renderer(r: &Value) -> Option<ChannelItem> {
 }
 
 fn parse_playlist_renderer(r: &Value) -> Option<PlaylistItem> {
-    let id = r.get("playlistId")?.as_str()?.to_string();
+    let id = r.get("playlistId").and_then(Value::as_str).or_else(|| {
+        r.pointer("/navigationEndpoint/browseEndpoint/browseId")?
+            .as_str()?
+            .strip_prefix("VL")
+            .filter(|id| !id.is_empty())
+    })?.to_string();
     let thumbnail = r
         .pointer("/thumbnails/0")
         .and_then(best_thumb)
         .or_else(|| r.get("thumbnail").and_then(best_thumb))
-        .or_else(|| r.pointer("/thumbnailRenderer/playlistVideoThumbnailRenderer/thumbnail").and_then(best_thumb));
+        .or_else(|| r.pointer("/thumbnailRenderer/playlistVideoThumbnailRenderer/thumbnail").and_then(best_thumb))
+        .or_else(|| r.pointer("/thumbnailRenderer/showCustomThumbnailRenderer/thumbnail").and_then(best_thumb));
     let owner = r.get("longBylineText").or_else(|| r.get("shortBylineText"));
     Some(PlaylistItem {
         id,
@@ -491,6 +497,7 @@ fn parse_playlist_renderer(r: &Value) -> Option<PlaylistItem> {
             .map(str::to_string),
         video_count_text: opt_text(r.get("videoCountText"))
             .or_else(|| opt_text(r.get("videoCountShortText")))
+            .or_else(|| opt_text(find(r.get("thumbnailOverlays")?, "thumbnailOverlayBottomPanelRenderer")?.get("text")))
             .or_else(|| r.get("videoCount").and_then(Value::as_str).map(|c| format!("{c} videos"))),
         first_video_id: r
             .pointer("/navigationEndpoint/watchEndpoint/videoId")
@@ -603,10 +610,13 @@ pub fn shorts_feed(token: Option<&str>, seed: Option<&str>) -> Result<(Vec<Video
         None => {
             let body = json!({ "params": "CA8%3D", "disablePlayerResponse": true, "inputType": "REEL_WATCH_INPUT_TYPE_SEEDLESS" });
             let r = call("reel/reel_item_watch", body)?;
-            if let Some(id) = r.pointer("/replacementEndpoint/reelWatchEndpoint/videoId").and_then(Value::as_str) {
-                ids.push(id.to_string());
+            let token = r.get("sequenceContinuation").and_then(Value::as_str).ok_or_else(|| anyhow!("no shorts sequence"))?.to_owned();
+            if let Some(id) = r.pointer("/replacementEndpoint/reelWatchEndpoint/videoId").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+                // The seed is already playable. The page can request the sequence after showing it.
+                let first = VideoItem { id: id.to_owned(), thumbnail: default_thumb(id), is_short: true, ..Default::default() };
+                return Ok((vec![first], Some(token)));
             }
-            r.get("sequenceContinuation").and_then(Value::as_str).ok_or_else(|| anyhow!("no shorts sequence"))?.to_string()
+            token
         }
     };
     let s = call("reel/reel_watch_sequence", json!({ "sequenceParams": seq }))?;
@@ -743,12 +753,17 @@ pub fn parse_youtube_url(input: &str) -> Option<ResolvedUrl> {
     if let Some(v) = get_param("v").filter(|v| is_id(v)) {
         return Some(ResolvedUrl::Video(v));
     }
-    if let Some(l) = get_param("list") {
+    // links can come from any web page (streamtube: links), so only take IDs
+    // made of the characters YouTube uses
+    let is_list_id = |x: &str| (2..=64).contains(&x.len()) && x.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if let Some(l) = get_param("list").filter(|l| is_list_id(l)) {
         return Some(ResolvedUrl::Playlist(l));
     }
     if let Some(rest) = s.split("/channel/").nth(1) {
-        let id: String = rest.chars().take_while(|c| *c != '/' && *c != '?').collect();
-        return Some(ResolvedUrl::Channel(id));
+        let id: String = rest.chars().take_while(|c| *c != '/' && *c != '?' && *c != '#').collect();
+        if id.starts_with("UC") && is_list_id(&id) {
+            return Some(ResolvedUrl::Channel(id));
+        }
     }
     None
 }
@@ -1546,6 +1561,49 @@ mod long_playlist_tests {
 
 #[cfg(test)]
 mod channel_tab_tests {
+    use super::{Item, collect_items, json};
+
+    #[test]
+    fn channel_show_cards_keep_the_playlist_id_and_episode_count() {
+        let page = collect_items(&json!({
+            "richGridRenderer": {
+                "contents": [{ "richItemRenderer": { "content": { "gridShowRenderer": {
+                    "title": {"simpleText": "Creator show"},
+                    "navigationEndpoint": { "browseEndpoint": { "browseId": "VLPLExampleShow" } },
+                    "thumbnailRenderer": { "showCustomThumbnailRenderer": { "thumbnail": { "thumbnails": [{
+                        "url": "https://i.ytimg.com/vi/example/hqdefault.jpg", "width": 480, "height": 270
+                    }] } } },
+                    "longBylineText": { "runs": [{ "text": "Creator" }] },
+                    "thumbnailOverlays": [{ "thumbnailOverlayBottomPanelRenderer": {
+                        "text": { "runs": [{ "text": "7" }, { "text": " episodes" }] }
+                    } }]
+                } } } }]
+            }
+        }));
+        let [Item::Playlist(show)] = page.items.as_slice() else { panic!("missing show card") };
+        assert_eq!(show.id, "PLExampleShow");
+        assert_eq!(show.title, "Creator show");
+        assert_eq!(show.channel_name.as_deref(), Some("Creator"));
+        assert_eq!(show.video_count_text.as_deref(), Some("7 episodes"));
+        assert_eq!(show.thumbnail.as_deref(), Some("https://i.ytimg.com/vi/example/hqdefault.jpg"));
+    }
+
+    #[test]
+    #[ignore = "network"]
+    fn channel_show_tabs_open_episode_lists() {
+        for id in ["UCGGZ_POGmIWG1pQXTDzQv-g", "UCPD_bxCRGpmmeQcbe2kpPaA"] {
+            let channel = super::channel(id, Some(crate::feed::VIDEOS_TAB)).unwrap();
+            let tab = channel.tabs.iter().find(|tab| tab.kind == "shows").expect("shows tab");
+            let page = super::channel(id, tab.params.as_deref()).unwrap();
+            let show = page.page.items.iter().find_map(|item| {
+                if let Item::Playlist(show) = item { Some(show) } else { None }
+            }).expect("show card");
+            let episodes = super::playlist(&show.id).unwrap().videos;
+            eprintln!("{}: {} ({} episodes loaded)", channel.info.name, show.title, episodes.len());
+            assert!(!episodes.is_empty());
+        }
+    }
+
     /// Tabs are told apart by kind in any content language.
     #[test]
     #[ignore = "network"]

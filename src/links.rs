@@ -137,7 +137,8 @@ pub fn listen() -> Option<futures::channel::mpsc::UnboundedReceiver<String>> {
         for stream in listener.incoming().flatten() {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             let mut line = String::new();
-            let mut reader = BufReader::new(&stream);
+            // a link is short; don't let another local process feed us endless bytes
+            let mut reader = BufReader::new(std::io::Read::take(&stream, 16 * 1024));
             if reader.read_line(&mut line).is_err() {
                 continue;
             }

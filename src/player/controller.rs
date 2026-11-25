@@ -13,8 +13,15 @@ use std::sync::Arc;
 pub enum PlayerEvent {
     Ended,
     Loaded,
+    PlaybackReadyChanged,
     /// average colour of the picture changed (ambient mode)
     Ambient,
+}
+
+#[derive(Clone, Copy)]
+pub enum KeyboardFeedback {
+    Volume(f64),
+    Seek(f64),
 }
 
 pub struct Player {
@@ -25,6 +32,7 @@ pub struct Player {
     pub video: Option<VideoItem>,
     pub streams: Option<Arc<StreamInfo>>,
     pub loading: bool,
+    pub playback_ready: bool,
     pub error: Option<String>,
     pub quality: u32,
     pub audio_only: bool,
@@ -33,10 +41,12 @@ pub struct Player {
     pub paused: bool,
     pub buffering: bool,
     pub seeking: bool,
-    pub cache_time: f64,
+    cache_time: f64,
+    preloaded_until: f64,
     pub volume: f64,
     pub muted: bool,
     pub speed: f64,
+    keyboard_feedback: Option<(KeyboardFeedback, Task<()>)>,
     pub eof: bool,
     pub frame: Option<Arc<RenderImage>>,
     old_frames: Vec<Arc<RenderImage>>,
@@ -55,6 +65,8 @@ pub struct Player {
     /// average colour of recent frames, for the ambient glow
     pub ambient: Option<Rgba>,
     ambient_tick: u32,
+    /// black bars found in recent frames, for the "Auto" aspect mode
+    pub auto_crop: super::aspect::AutoCrop,
     pub loop_video: bool,
     load_serial: u64,
     last_progress_save: f64,
@@ -110,6 +122,7 @@ impl Player {
             video: None,
             streams: None,
             loading: false,
+            playback_ready: false,
             error: None,
             quality: s.default_quality,
             audio_only: s.audio_only,
@@ -119,10 +132,12 @@ impl Player {
             buffering: false,
             seeking: false,
             cache_time: 0.0,
+            preloaded_until: 0.0,
             volume: s.volume,
             muted: false,
             speed: s.default_speed,
             boost: None,
+            keyboard_feedback: None,
             eof: false,
             frame: None,
             old_frames: Vec::new(),
@@ -139,6 +154,7 @@ impl Player {
             annotations: Arc::new(Vec::new()),
             ambient: None,
             ambient_tick: 0,
+            auto_crop: Default::default(),
             loop_video: s.loop_video,
             load_serial: 0,
             last_progress_save: 0.0,
@@ -177,8 +193,8 @@ impl Player {
             ("input-vo-keyboard", "no"),
             ("osc", "no"),
             ("cache", "yes"),
-            ("demuxer-max-bytes", "96MiB"),
-            ("demuxer-max-back-bytes", "24MiB"),
+            ("demuxer-max-bytes", "48MiB"),
+            ("demuxer-max-back-bytes", "12MiB"),
             ("demuxer-readahead-secs", "40"),
             ("network-timeout", "20"),
             ("user-agent", ua),
@@ -248,7 +264,12 @@ impl Player {
                 Some(m)
             }
             Err(e) => {
-                self.init_error = Some(tf!("Could not start the video engine (libmpv): {0}", e));
+                let error = e.to_string();
+                self.init_error = Some(match error.as_str() {
+                    #[cfg(windows)]
+                    super::mpv::MISSING_WINDOWS_MPV => translate(super::mpv::MISSING_WINDOWS_MPV).to_owned(),
+                    _ => tf!("Could not start the video engine (libmpv): {0}", error),
+                });
                 None
             }
         }
@@ -276,6 +297,10 @@ impl Player {
                                 }
                             }
                         }
+                        // a few looks a second are enough to follow the bars
+                        if self.ambient_tick % 10 == 0 && store::settings_snapshot().aspect_mode == "auto" {
+                            self.auto_crop.feed(super::aspect::detect_bars(&f.data, f.width, f.height));
+                        }
                         if let Some(buf) = image::RgbaImage::from_raw(f.width, f.height, f.data) {
                             let img = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(buf)]));
                             if let Some(old) = self.frame.replace(img) {
@@ -292,6 +317,9 @@ impl Player {
                 }
             }
             MpvEvent::FileLoaded => {
+                if self.video.as_ref().is_some_and(|v| v.is_short) {
+                    self.cache_time = 0.0;
+                }
                 self.loading = false;
                 self.eof = false;
                 self.apply_caption();
@@ -299,6 +327,9 @@ impl Player {
                 cx.notify();
             }
             MpvEvent::PlaybackRestart => {
+                if !self.loading && !self.buffering && self.streams.is_some() {
+                    self.set_playback_ready(true, cx);
+                }
                 self.seeking = false;
                 cx.notify();
             }
@@ -329,6 +360,9 @@ impl Player {
                 match (name, val) {
                     ("time-pos", PropValue::Double(t)) => {
                         self.time = t;
+                        if t > 0. && !self.loading && !self.buffering && !self.paused && !self.playback_ready {
+                            self.set_playback_ready(true, cx);
+                        }
                         self.on_time(cx);
                     }
                     ("duration", PropValue::Double(d)) => self.duration = d,
@@ -340,7 +374,12 @@ impl Player {
                             self.eof = false;
                         }
                     }
-                    ("paused-for-cache", PropValue::Flag(b)) => self.buffering = b,
+                    ("paused-for-cache", PropValue::Flag(b)) => {
+                        self.buffering = b;
+                        if b {
+                            self.set_playback_ready(false, cx);
+                        }
+                    }
                     ("seeking", PropValue::Flag(b)) => self.seeking = b,
                     ("demuxer-cache-time", PropValue::Double(c)) => self.cache_time = c,
                     ("speed", PropValue::Double(s)) => self.speed = s,
@@ -496,7 +535,20 @@ impl Player {
     }
 
     /// Starts playing a video. Fetches streams, SponsorBlock segments and resumes progress.
+    fn set_playback_ready(&mut self, ready: bool, cx: &mut Context<Self>) {
+        if self.playback_ready != ready {
+            self.playback_ready = ready;
+            if !ready {
+                super::shorts_preload::suspend();
+            }
+            cx.emit(PlayerEvent::PlaybackReadyChanged);
+        }
+    }
+
     pub fn play(&mut self, video: VideoItem, start: Option<f64>, cx: &mut Context<Self>) {
+        self.keyboard_feedback = None;
+        self.preloaded_until = 0.0;
+        self.set_playback_ready(false, cx);
         self.save_progress(true);
         if let Some(prev) = &self.video {
             crate::api::web::report_stop(&prev.id, self.time);
@@ -524,6 +576,7 @@ impl Player {
         self.heatmap.clear();
         self.annotations = Arc::new(Vec::new());
         self.ambient = None;
+        self.auto_crop = Default::default();
         self.channel_id = video.channel_id.clone();
         self.audio_track = None;
         if let Some(old) = self.frame.take() {
@@ -646,6 +699,7 @@ impl Player {
 
     /// The built-in streams failed to open: fetch them again through yt-dlp.
     fn fallback_to_ytdlp(&mut self, cx: &mut Context<Self>) {
+        self.preloaded_until = 0.0;
         self.fallback_tried = true;
         let Some(id) = self.video.as_ref().map(|v| v.id.clone()) else { return };
         streams::invalidate(&id);
@@ -678,21 +732,50 @@ impl Player {
 
     /// (Re)loads current streams into mpv with current quality/audio settings.
     fn load_current(&mut self, start: Option<f64>, keep_pause: bool, cx: &mut Context<Self>) {
+        self.preloaded_until = 0.0;
+        self.set_playback_ready(false, cx);
         let (Some(mpv), Some(info)) = (self.mpv.clone(), self.streams.clone()) else { return };
         let s = store::settings_snapshot();
-        let src = if info.hls_only {
-            let audio = streams::hls_audio_choice(&info, self.audio_track.as_deref());
-            info.hls_url.as_deref().map(|u| crate::player::proxy::local_hls(u, self.quality, audio.as_deref()))
-        } else if info.is_live || (info.video.is_empty() && info.muxed.is_empty()) {
-            info.hls_url.clone()
-        } else {
-            let (v, a) = streams::pick_formats(&info, self.quality, &s.codec_pref, self.audio_track.as_deref());
-            let v = if self.audio_only { None } else { v };
-            if v.is_none() && a.is_none() {
-                info.muxed.last().map(|m| m.url.clone())
-            } else {
+        let is_short = self.video.as_ref().is_some_and(|v| v.is_short) && !info.is_live;
+        let selection = streams::playback_stream(
+            &info,
+            self.quality,
+            &s.codec_pref,
+            self.audio_track.as_deref(),
+            self.audio_only,
+        );
+        let mut opening = 0.0;
+        let src = match selection {
+            Some(streams::PlaybackStream::Hls(url)) if info.hls_only || is_short => {
+                let audio = streams::hls_audio_choice(&info, self.audio_track.as_deref());
+                let source = super::proxy::local_hls(url, self.quality, audio.as_deref());
+                if is_short && source != url && start.unwrap_or(0.0) == 0.0 {
+                    opening = super::shorts_preload::hls_opening_seconds(
+                        url,
+                        self.quality,
+                        audio.as_deref(),
+                    )
+                    .unwrap_or(0.0);
+                }
+                Some(source)
+            }
+            Some(streams::PlaybackStream::Hls(url)) => {
+                // libmpv only speaks HTTP proxies: with a SOCKS proxy, live HLS goes through the local proxy
+                if crate::store::proxy_setting().is_some_and(|p| !crate::store::mpv_http_proxy(&p)) {
+                    let audio = streams::hls_audio_choice(&info, self.audio_track.as_deref());
+                    Some(super::proxy::local_hls(url, self.quality, audio.as_deref()))
+                } else {
+                    Some(url.to_owned())
+                }
+            }
+            Some(streams::PlaybackStream::Muxed(m)) if is_short => {
+                Some(super::proxy::local_url(&m.url, m.content_length, &m.mime))
+            }
+            Some(streams::PlaybackStream::Muxed(m)) => Some(m.url.clone()),
+            Some(streams::PlaybackStream::Adaptive(v, a)) => {
                 streams::mpv_source(v, a, info.length_secs)
             }
+            None => None,
         };
         let Some(src) = src else {
             self.error = Some(translate("No playable stream found").into());
@@ -725,8 +808,17 @@ impl Player {
         if let Err(e) = res {
             self.loading = false;
             self.error = Some(e.to_string());
+        } else {
+            self.preloaded_until = opening;
         }
         cx.notify();
+    }
+
+    pub fn buffered_until(&self) -> f64 {
+        if self.loading && self.video.as_ref().is_some_and(|v| v.is_short) {
+            return self.preloaded_until;
+        }
+        self.cache_time.max(self.preloaded_until)
     }
 
     /// Applies caption styling settings to mpv (see [`caption_font`] and [`mpv_color`]).
@@ -768,7 +860,12 @@ impl Player {
         let (Some(mpv), Some(info)) = (&self.mpv, &self.streams) else { return };
         let _ = mpv.command(&["sub-remove"]);
         if let Some(c) = self.caption.and_then(|i| info.captions.get(i)) {
-            let _ = mpv.command(&["sub-add", &c.url, "select", &c.name, &c.lang]);
+            let url = if crate::store::proxy_setting().is_some() {
+                crate::player::proxy::local_pass(&c.url)
+            } else {
+                c.url.clone()
+            };
+            let _ = mpv.command(&["sub-add", &url, "select", &c.name, &c.lang]);
         } else {
             mpv.set("sid", "no");
         }
@@ -894,6 +991,13 @@ impl Player {
         if let Some(v) = &self.video {
             let source = self.streams.as_ref().map(|s| s.source).unwrap_or("");
             out.push(("Video ID", if source.is_empty() { v.id.clone() } else { tf!("{0}, via {1}", v.id, source) }));
+            if v.is_short {
+                let bytes = super::shorts_preload::served_bytes(&v.id);
+                out.push((
+                    "Read from Shorts preload",
+                    tf!("{0} MB", format_args!("{:.2}", bytes as f64 / 1048576.0)),
+                ));
+            }
         }
         if !self.audio_only {
             let (w, h) = (f("video-params/w").unwrap_or(0.0), f("video-params/h").unwrap_or(0.0));
@@ -966,7 +1070,8 @@ impl Player {
     }
 
     pub fn seek_to(&mut self, t: f64) {
-        let t = if self.duration > 0.0 { t.clamp(0.0, self.duration - 0.1) } else { t.max(0.0) };
+        self.preloaded_until = 0.0;
+        let t = if self.duration > 0.0 { t.clamp(0.0, (self.duration - 0.1).max(0.0)) } else { t.max(0.0) };
         self.time = t;
         if let Some(m) = &self.mpv {
             let _ = m.command(&["seek", &format!("{t}"), "absolute+exact"]);
@@ -976,6 +1081,21 @@ impl Player {
     pub fn seek_by(&mut self, d: f64) {
         let t = self.time + d;
         self.seek_to(t);
+    }
+
+    pub fn keyboard_feedback(&self) -> Option<KeyboardFeedback> {
+        self.keyboard_feedback.as_ref().map(|(feedback, _)| *feedback)
+    }
+
+    pub fn show_keyboard_feedback(&mut self, feedback: KeyboardFeedback, cx: &mut Context<Self>) {
+        let hide = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(900)).await;
+            let _ = this.update(cx, |player, cx| {
+                player.keyboard_feedback = None;
+                cx.notify();
+            });
+        });
+        self.keyboard_feedback = Some((feedback, hide));
     }
 
     pub fn set_volume(&mut self, v: f64) {
@@ -1034,6 +1154,12 @@ impl Player {
         }
     }
 
+    pub fn step_speed(&mut self, increase: bool) {
+        let steps = self.speed / 0.25;
+        let next = if increase { steps.floor() + 1.0 } else { steps.ceil() - 1.0 };
+        self.set_speed(next * 0.25);
+    }
+
     pub fn set_loop(&mut self, l: bool) {
         self.loop_video = l;
     }
@@ -1060,6 +1186,9 @@ impl Player {
     }
 
     pub fn stop(&mut self, cx: &mut Context<Self>) {
+        self.keyboard_feedback = None;
+        self.preloaded_until = 0.0;
+        self.set_playback_ready(false, cx);
         self.save_progress(true);
         if let Some(v) = &self.video {
             crate::api::web::report_stop(&v.id, self.time);

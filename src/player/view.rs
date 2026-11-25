@@ -1,11 +1,13 @@
 //! Video surface + YouTube-style controls.
-use super::controller::Player;
+use super::aspect;
+use super::controller::{KeyboardFeedback, Player};
 use crate::i18n::{t as translate, tf};
 use crate::api::json::format_duration;
 use crate::api::services;
 use crate::store;
-use crate::ui::app::{Route, UiState, navigate};
-use crate::ui::{icon, pal};
+use crate::ui::app::{Route, UiState, navigate, open_menu};
+use crate::ui::cards::download_menu_items;
+use crate::ui::{icon, icon_button, pal};
 use gpui_kit::*;
 use gpui_kit::prelude::*;
 use std::cell::Cell;
@@ -51,6 +53,7 @@ enum Menu {
     Speed,
     Captions,
     Audio,
+    Aspect,
 }
 
 pub struct PlayerView {
@@ -79,6 +82,13 @@ pub struct PlayerView {
     /// left button held on the video; after a moment it plays at 2x
     press: Option<Instant>,
     press_boosted: bool,
+    /// picture-in-picture: where a left press on the video started; moving
+    /// from there drags the whole window, like a browser's PiP
+    pip_press: Option<Point<Pixels>>,
+    /// the last press moved the PiP window, so its release is not a click
+    pip_moved: bool,
+    /// a window move was just requested; the system echoes it as a press
+    pip_move_echo: bool,
     /// the player's area, for placing annotations over the picture
     area: Rc<Cell<Bounds<Pixels>>>,
     /// the area's annotation under the pointer (shows a highlight's rollover text)
@@ -111,6 +121,9 @@ impl PlayerView {
             last_click: None,
             press: None,
             press_boosted: false,
+            pip_press: None,
+            pip_moved: false,
+            pip_move_echo: false,
             area: Rc::new(Cell::new(Bounds::default())),
             hover_annotation: None,
             was_playing: false,
@@ -168,7 +181,7 @@ impl PlayerView {
 
 /// Hides the mouse pointer until it moves again. GPUI has no public call for
 /// this, so it's per platform; Linux keeps the pointer for now.
-fn hide_pointer_until_moved() {
+pub(crate) fn hide_pointer_until_moved() {
     #[cfg(target_os = "macos")]
     unsafe {
         let _: () = objc2::msg_send![objc2::class!(NSCursor), setHiddenUntilMouseMoves: true];
@@ -179,6 +192,12 @@ fn hide_pointer_until_moved() {
     unsafe {
         windows::Win32::UI::WindowsAndMessaging::SetCursor(None);
     }
+}
+
+/// Saves the aspect mode (a value of `aspect::MODES`) and redraws every player with it.
+pub fn set_aspect_mode(value: &str, cx: &mut App) {
+    store::update_settings(|s| s.aspect_mode = value.to_string());
+    cx.refresh_windows();
 }
 
 fn speed_label(s: f64) -> String {
@@ -227,6 +246,10 @@ impl Render for PlayerView {
             px(store::settings_snapshot().thumb_radius)
         };
         let view = cx.entity().downgrade();
+        let aspect = aspect::Mode::parse(&store::settings_snapshot().aspect_mode);
+        let auto_trim = pl.auto_crop.trim;
+        let short_cover = video.as_ref().filter(|_| ui.shorts && !mini && !self.pip && !audio_only && (pl.loading || frame.is_none()) && error.is_none());
+        let picture = frame.clone().filter(|_| !audio_only && short_cover.is_none());
 
         // ── video surface ──
         let surface = div()
@@ -252,7 +275,17 @@ impl Render for PlayerView {
                             }
                         }
                     },
-                    move |_, _, window, _| {
+                    move |bounds, _, window, _| {
+                        // the frame, cropped / zoomed for the aspect mode; what falls
+                        // outside the player is clipped by paint_image
+                        if let Some(f) = picture {
+                            let dims = f.size(0);
+                            let fsize = (i32::from(dims.width) as f32, i32::from(dims.height) as f32);
+                            let (region, fit) = aspect::resolve(aspect, fsize, (vsize.0 as f32, vsize.1 as f32), auto_trim);
+                            let (x, y, w, h) = aspect::layout((f32::from(bounds.size.width), f32::from(bounds.size.height)), fsize, region, fit);
+                            let image = Bounds::new(bounds.origin + point(px(x), px(y)), size(px(w), px(h)));
+                            let _ = window.paint_image(bounds, image, Corners::all(player_radius), f, 0, false);
+                        }
                         window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
                             if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
                                 let _ = view.update(cx, |view, cx| view.finish_pointer_press(cx));
@@ -263,8 +296,8 @@ impl Render for PlayerView {
                 .absolute()
                 .size_full(),
             )
-            .when_some(frame.filter(|_| !audio_only), |d, f| {
-                d.child(img(ImageSource::Render(f)).absolute().size_full().rounded(player_radius).object_fit(ObjectFit::Contain))
+            .when_some(short_cover, |d, v| {
+                d.child(img(SharedString::from(v.thumbnail.clone())).absolute().size_full().rounded(player_radius).object_fit(ObjectFit::Cover))
             })
             .when(audio_only, |d| {
                 d.when_some(video.as_ref().map(|v| v.thumbnail.clone()), |d, t| {
@@ -320,10 +353,21 @@ impl Render for PlayerView {
                 }
                 cx.notify();
             }))
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 // the button was let go somewhere we didn't see
                 if ev.pressed_button != Some(MouseButton::Left) {
                     this.finish_pointer_press(cx);
+                    this.pip_press = None;
+                }
+                // PiP: dragging the picture moves the window
+                if let Some(origin) = this.pip_press.filter(|_| this.drag_seek.is_none() && !this.drag_vol) {
+                    if (ev.position - origin).magnitude() >= 5. {
+                        this.pip_press = None;
+                        this.pip_moved = true;
+                        this.pip_move_echo = true;
+                        crate::ui::pip::begin_window_move(window);
+                        return;
+                    }
                 }
                 // a seek or volume drag whose release we missed (something under
                 // the pointer kept it) ends here, where the button was last held
@@ -381,8 +425,16 @@ impl Render for PlayerView {
                 .inset_0()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                        if this.mini || this.pip {
+                    cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                        if this.pip {
+                            if std::mem::take(&mut this.pip_move_echo) {
+                                return;
+                            }
+                            this.pip_moved = false;
+                            this.pip_press = Some(ev.position);
+                            return;
+                        }
+                        if this.mini {
                             return;
                         }
                         let at = Instant::now();
@@ -414,8 +466,9 @@ impl Render for PlayerView {
                     }),
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    // the release that ends a press-and-hold isn't a click
-                    if std::mem::take(&mut this.press_boosted) {
+                    // the release that ends a press-and-hold, or a PiP window move, isn't a click
+                    this.pip_press = None;
+                    if std::mem::take(&mut this.press_boosted) || std::mem::take(&mut this.pip_moved) {
                         return;
                     }
                     if this.zone_seek.take().map(|t| t.elapsed() < Duration::from_millis(800)).unwrap_or(false) {
@@ -450,7 +503,19 @@ impl Render for PlayerView {
             }
         }
 
-        if self.player.read(cx).boost.is_some() {
+        let player = self.player.read(cx);
+        let feedback = match player.keyboard_feedback() {
+            Some(KeyboardFeedback::Volume(volume)) => Some(("volume-2", tf!("{0}%", volume.round()))),
+            Some(KeyboardFeedback::Seek(seconds)) => {
+                let icon = if seconds < 0.0 { "arrow-left" } else { "arrow-right" };
+                let seconds = (seconds * 10.0).round() / 10.0;
+                let label = if seconds == 0.0 { "0".into() } else { format!("{seconds:+}") };
+                Some((icon, tf!("{0} s", label)))
+            }
+            None if player.boost.is_some() => Some(("fast-forward", "2x".into())),
+            None => None,
+        };
+        if let Some((feedback_icon, text)) = feedback {
             root = root.child(
                 div().absolute().top_4().left_0().right_0().flex().justify_center().child(
                     div()
@@ -464,8 +529,8 @@ impl Render for PlayerView {
                         .text_color(white())
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("2x")
-                        .child(crate::ui::icon("fast-forward").size_4().text_color(white())),
+                        .child(text)
+                        .child(icon(feedback_icon).size_4().text_color(white())),
                 ),
             );
         }
@@ -545,6 +610,23 @@ impl Render for PlayerView {
 
         if mini {
             return root.child(self.render_mini_controls(show, paused, time, duration, cx)).into_any_element();
+        }
+
+        if let Some(video) = video.filter(|v| ui.shorts && !self.pip && v.is_short) {
+            root = root.child(
+                icon_button("sh-download", "download", cx)
+                    .absolute()
+                    .top_3()
+                    .right_3()
+                    .bg(p.chip)
+                    .occlude()
+                    .tooltip(|window, cx| component::tooltip::Tooltip::new(translate("Download")).build(window, cx))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(move |ev, window, cx| {
+                        cx.stop_propagation();
+                        open_menu(ev.position(), download_menu_items(&video), window, cx);
+                    }),
+            );
         }
 
         // SponsorBlock prompt / highlight
@@ -640,11 +722,18 @@ impl PlayerView {
         }
         let area = self.area.get();
         let (aw, ah) = (f32::from(area.size.width), f32::from(area.size.height));
-        // the picture inside the player, as mpv draws it (fit, centered)
-        let (vw, vh) = if vsize.0 > 0.0 && vsize.1 > 0.0 { (vsize.0 as f32, vsize.1 as f32) } else { (16.0, 9.0) };
-        let k = (aw / vw).min(ah / vh);
-        let (pw, ph) = (vw * k, vh * k);
-        let (ox, oy) = ((aw - pw) / 2.0, (ah - ph) / 2.0);
+        // the picture inside the player, placed as the surface draws it (cropped or zoomed for the aspect mode)
+        let video = if vsize.0 > 0.0 && vsize.1 > 0.0 { (vsize.0 as f32, vsize.1 as f32) } else { (16.0, 9.0) };
+        let (fsize, trim) = {
+            let pl = self.player.read(cx);
+            let dims = pl.frame.as_ref().map(|f| f.size(0));
+            (dims.map(|d| (i32::from(d.width) as f32, i32::from(d.height) as f32)).unwrap_or(video), pl.auto_crop.trim)
+        };
+        let mode = aspect::Mode::parse(&store::settings_snapshot().aspect_mode);
+        let (region, fit) = aspect::resolve(mode, fsize, video, trim);
+        let (ix, iy, iw, ih) = aspect::layout((aw, ah), fsize, region, fit);
+        let pic = aspect::picture_region(fsize, video);
+        let (ox, oy, pw, ph) = (ix + pic.x * iw, iy + pic.y * ih, pic.w * iw, pic.h * ih);
         let hovered = self.hover_annotation.clone();
         let rgba = |c: u32, a: f32| {
             let mut c = rgb(c);
@@ -749,9 +838,10 @@ fn context_items(player: &Entity<Player>, cx: &App) -> Vec<crate::ui::app::MenuI
     let t = pl.time.max(0.0) as u64;
     let looping = pl.loop_video;
     let stats = pl.show_stats;
+    let can_step = pl.video.is_some() && !pl.loading && !pl.audio_only;
     let (p1, p2, p3, p4) = (player.clone(), player.clone(), player.clone(), player.clone());
     let (id1, id2) = (id.clone(), id);
-    vec![
+    let mut items = vec![
         MenuItem::new("repeat", translate(if looping { "Loop: on" } else { "Loop: off" }), move |_, cx| {
             p1.update(cx, |p, cx| {
                 p.set_loop(!looping);
@@ -773,13 +863,29 @@ fn context_items(player: &Entity<Player>, cx: &App) -> Vec<crate::ui::app::MenuI
                 cx.notify()
             })
         }),
-    ]
-    .into_iter()
-    .chain(std::iter::once(MenuItem::new("pause", translate("Play / pause"), move |_, cx| p4.update(cx, |p, cx| {
-        p.toggle_pause();
-        cx.notify()
-    }))))
-    .collect()
+        MenuItem::new("pause", translate("Play / pause"), move |_, cx| p4.update(cx, |p, cx| {
+            p.toggle_pause();
+            cx.notify()
+        })),
+    ];
+    if can_step {
+        for (forward, icon, label, key) in [
+            (false, "chevron-left", translate("Previous frame"), ','),
+            (true, "chevron-right", translate("Next frame"), '.'),
+        ] {
+            let player = player.clone();
+            items.push(MenuItem::new(icon, format!("{label} ({key})"), move |_, cx| {
+                player.update(cx, |p, cx| {
+                    if !p.paused {
+                        p.set_paused(true);
+                    }
+                    p.frame_step(forward);
+                    cx.notify();
+                });
+            }));
+        }
+    }
+    items
 }
 
 fn navigate_to_current(this: &mut PlayerView, window: &mut Window, cx: &mut Context<PlayerView>) {
@@ -921,7 +1027,7 @@ impl PlayerView {
         let muted = pl.muted;
         let segments = pl.segments.clone();
         let chapters = pl.chapters.clone();
-        let cache = pl.cache_time;
+        let cache = pl.buffered_until();
         let caption_on = pl.caption.is_some();
         let has_captions = pl.streams.as_ref().map(|s| !s.captions.is_empty()).unwrap_or(false);
         let storyboard = pl.storyboard.clone();
@@ -1556,6 +1662,10 @@ impl PlayerView {
                         let cur = pl.audio_track.clone().unwrap_or_else(|| translate("Default").into());
                         d.child(row("m-a".into(), Some("languages"), translate("Audio track").into(), Some(cur), false).on_click(cx.listener(|t, _, _, cx| { t.menu = Some(Menu::Audio); cx.notify() })))
                     })
+                    .when(!audio_only, |d| {
+                        let cur = translate(aspect::label(&store::settings_snapshot().aspect_mode)).to_string();
+                        d.child(row("m-ar".into(), Some("ratio"), translate("Aspect ratio").into(), Some(cur), false).on_click(cx.listener(|t, _, _, cx| { t.menu = Some(Menu::Aspect); cx.notify() })))
+                    })
                     .child(
                         row("m-ao".into(), Some("headphones"), translate("Audio only (background)").into(), Some(translate(if audio_only { "On" } else { "Off" }).into()), false)
                             .on_click(cx.listener(move |t, _, _, cx| t.player.update(cx, |p, cx| p.set_audio_only(!audio_only, cx)))),
@@ -1686,6 +1796,16 @@ impl PlayerView {
                             this.player.update(cx, |p, cx| p.set_audio_track(Some(t3), cx));
                         })),
                     );
+                }
+            }
+            Menu::Aspect => {
+                let cur = store::settings_snapshot().aspect_mode.clone();
+                panel = panel.child(header("Aspect ratio", cx));
+                for &(value, label) in aspect::MODES {
+                    panel = panel.child(row(SharedString::from(format!("ar-{value}")), None, translate(label).into(), None, cur == value).on_click(cx.listener(move |t, _, _, cx| {
+                        t.menu = None;
+                        set_aspect_mode(value, cx);
+                    })));
                 }
             }
         }

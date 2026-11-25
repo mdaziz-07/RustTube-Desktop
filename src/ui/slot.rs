@@ -33,14 +33,14 @@ pub struct SlotFollower {
 }
 
 impl SlotFollower {
-    pub fn new(cx: &App, view: AnyView) -> Self {
-        Self::with_slot(cx.global::<PlayerSlot>().0.clone(), view)
+    pub fn new(cx: &App, content: impl IntoElement) -> Self {
+        Self::with_slot(cx.global::<PlayerSlot>().0.clone(), content)
     }
 
     /// Follows any slot (e.g. the thumbnail being previewed).
-    pub fn with_slot(slot: Rc<Cell<Option<Bounds<Pixels>>>>, view: AnyView) -> Self {
+    pub fn with_slot(slot: Rc<Cell<Option<Bounds<Pixels>>>>, content: impl IntoElement) -> Self {
         let laid_size = slot.get().map(|b| b.size);
-        let child = laid_size.map(|s| div().w(s.width).h(s.height).child(view).into_any_element());
+        let child = laid_size.map(|s| div().w(s.width).h(s.height).child(content).into_any_element());
         Self { slot, child, laid_size, can_paint: false }
     }
 }

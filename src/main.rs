@@ -126,7 +126,8 @@ fn main() {
                 })
                 .detach();
             }
-            cx.on_window_closed(|cx, _| {
+            cx.on_window_closed(|cx, id| {
+                ui::pip::window_closed(id, cx);
                 // the picture-in-picture window alone doesn't keep the app running
                 let pip = ui::pip::handle(cx);
                 if cx.windows().iter().all(|w| Some(*w) == pip) {

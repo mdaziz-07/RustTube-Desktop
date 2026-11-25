@@ -4,7 +4,9 @@
 use anyhow::{Result, anyhow};
 use libloading::Library;
 use parking_lot::{Condvar, Mutex};
+use std::error::Error;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -79,19 +81,33 @@ struct Fns {
     rc_free: unsafe extern "C" fn(*mut mpv_render_context),
 }
 
+#[cfg(windows)]
+const LIBRARY_NAMES: &[&str] = &["libmpv-2.dll", "mpv-2.dll"];
+#[cfg(target_os = "macos")]
+const LIBRARY_NAMES: &[&str] = &["libmpv.2.dylib"];
+#[cfg(not(any(windows, target_os = "macos")))]
+const LIBRARY_NAMES: &[&str] = &["libmpv.so.2", "libmpv.so.1", "libmpv.so"];
+
+#[cfg(windows)]
+pub(super) const MISSING_WINDOWS_MPV: &str =
+    "libmpv-2.dll is missing. Extract the entire Windows ZIP before opening streamtube.exe, or use the Windows installer.";
+
 fn lib() -> Result<&'static (Library, Fns)> {
     static LIB: std::sync::OnceLock<Result<(Library, Fns), String>> = std::sync::OnceLock::new();
-    LIB.get_or_init(|| unsafe {
+    LIB.get_or_init(|| {
         #[cfg(windows)]
-        preload_vulkan_loader();
-        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        unsafe {
+            preload_vulkan_loader();
+        }
+        let mut candidates = Vec::new();
+        #[cfg(any(windows, target_os = "linux"))]
         if let Ok(exe) = std::env::current_exe() {
             if let Some(d) = exe.parent() {
-                candidates.push(d.join("libmpv-2.dll"));
-                candidates.push(d.join("mpv-2.dll"));
+                #[cfg(windows)]
+                candidates.extend(LIBRARY_NAMES.iter().map(|name| d.join(name)));
                 // the AppImage carries its own libmpv in usr/lib, next to usr/bin
                 #[cfg(target_os = "linux")]
-                for name in ["libmpv.so.2", "libmpv.so.1"] {
+                for &name in &LIBRARY_NAMES[..2] {
                     let p = d.join("../lib").join(name);
                     if p.is_file() {
                         candidates.push(p);
@@ -100,14 +116,16 @@ fn lib() -> Result<&'static (Library, Fns)> {
             }
         }
         #[cfg(windows)]
-        candidates.push(std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/third_party/mpv/libmpv-2.dll")));
-        candidates.push("libmpv-2.dll".into());
-        candidates.push("mpv-2.dll".into());
-        candidates.push("libmpv.so.2".into());
-        // older distributions (Ubuntu 22.04, Debian 11) ship the same API as .so.1
-        candidates.push("libmpv.so.1".into());
-        candidates.push("libmpv.so".into());
-        candidates.push("libmpv.2.dylib".into());
+        candidates.push(PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/third_party/mpv/libmpv-2.dll")));
+        candidates.extend(LIBRARY_NAMES.iter().map(PathBuf::from));
+        open_library(candidates)
+    })
+    .as_ref()
+    .map_err(|e| anyhow!("{e}"))
+}
+
+fn open_library(candidates: impl IntoIterator<Item = PathBuf>) -> Result<(Library, Fns), String> {
+    unsafe {
         let mut last_err = String::from("libmpv not found");
         // the error from a copy that is there but won't load says more than
         // "not found" from the names tried after it
@@ -144,17 +162,43 @@ fn lib() -> Result<&'static (Library, Fns)> {
                     return Ok((l, fns));
                 }
                 Err(e) => {
-                    last_err = format!("{}: {e}", c.display());
+                    last_err = match e.source() {
+                        Some(source) => format!("{} ({e}, {source})", c.display()),
+                        None => format!("{} ({e})", c.display()),
+                    };
                     if first_real_err.is_none() && c.is_absolute() && c.is_file() {
                         first_real_err = Some(last_err.clone());
                     }
                 }
             }
         }
+        #[cfg(windows)]
+        if first_real_err.is_none() {
+            return Err(MISSING_WINDOWS_MPV.into());
+        }
         Err(first_real_err.unwrap_or(last_err))
-    })
-    .as_ref()
-    .map_err(|e| anyhow!("{e}"))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_loader_tests {
+    use super::{MISSING_WINDOWS_MPV, open_library};
+
+    #[test]
+    fn missing_dll_explains_how_to_open_the_portable_app() {
+        let path = crate::store::data_dir().join("missing-test-engine").join("libmpv-2.dll");
+        let error = open_library([path]).err().expect("missing playback library");
+        assert_eq!(error, MISSING_WINDOWS_MPV);
+    }
+
+    #[test]
+    fn existing_dll_keeps_the_windows_loader_error() {
+        let path = crate::store::data_dir().join("invalid-test-engine.dll");
+        std::fs::write(&path, b"invalid DLL").unwrap();
+        let error = open_library([path.clone()]).err().expect("invalid playback library");
+        assert!(error.contains(&*path.to_string_lossy()));
+        assert!(error.contains("193"), "{error}");
+    }
 }
 
 /// libmpv-2.dll links against vulkan-1.dll, which Windows only has when the GPU

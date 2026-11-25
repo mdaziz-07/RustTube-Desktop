@@ -270,10 +270,8 @@ fn hls_client(video_id: &str, c: HlsClient) -> Result<StreamInfo> {
             headers.push(("X-Goog-Visitor-Id", vd));
         }
         let r = http::post_json("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", &body, &headers)?;
-        let status = r.pointer("/playabilityStatus/status").and_then(Value::as_str).unwrap_or("");
-        if status != "OK" {
-            let reason = r.pointer("/playabilityStatus/reason").and_then(Value::as_str).unwrap_or(status);
-            return Err(anyhow!("{label}: {reason}"));
+        if let Some(err) = playability_error(&r, Some(label)) {
+            return Err(err);
         }
         Ok(r)
     };
@@ -308,7 +306,7 @@ fn hls_client(video_id: &str, c: HlsClient) -> Result<StreamInfo> {
     // adaptive URLs from this client need a PO token; only the HLS path is usable
     info.audio.clear();
     info.muxed.clear();
-    let (video, audio, hls_orig_lang) = hls_variants(&hls).unwrap_or_default();
+    let (video, audio, hls_orig_lang) = hls_variants(video_id, &hls).unwrap_or_default();
     info.video = video;
     // audio renditions (dubbed tracks): only names, the proxy picks the playlist
     info.audio = audio;
@@ -322,8 +320,9 @@ fn hls_client(video_id: &str, c: HlsClient) -> Result<StreamInfo> {
 
 /// The variants of an HLS master playlist, as formats for the quality menu,
 /// plus its audio renditions (one per language, `audio_language` = display name).
-fn hls_variants(master_url: &str) -> Result<(Vec<StreamFormat>, Vec<StreamFormat>, Option<String>)> {
+fn hls_variants(video_id: &str, master_url: &str) -> Result<(Vec<StreamFormat>, Vec<StreamFormat>, Option<String>)> {
     let text = http::get_text(master_url)?;
+    crate::player::shorts_preload::remember_master(video_id, master_url, &text);
     let attr = |l: &str, k: &str| -> Option<String> {
         let rest = l.split(&format!("{k}=")).nth(1)?;
         Some(if let Some(q) = rest.strip_prefix('"') { q.split('"').next()?.to_string() } else { rest.split(',').next()?.to_string() })
@@ -458,17 +457,33 @@ fn android_vr(video_id: &str) -> Result<StreamInfo> {
         &body,
         &[("User-Agent", VR_UA), ("X-YouTube-Client-Name", "28"), ("X-YouTube-Client-Version", VR_VERSION), ("X-Goog-Visitor-Id", &vd)],
     )?;
-    let status = r.pointer("/playabilityStatus/status").and_then(Value::as_str).unwrap_or("");
-    if status != "OK" {
-        let reason = r
-            .pointer("/playabilityStatus/reason")
-            .and_then(Value::as_str)
-            .unwrap_or(status);
-        return Err(anyhow!("{reason}"));
+    if let Some(err) = playability_error(&r, None) {
+        return Err(err);
     }
     let mut info = parse_player(&r);
     info.source = "innertube";
     Ok(info)
+}
+
+/// Returns an error when YouTube's `playabilityStatus` is not `OK`.
+/// Keeps the machine-readable `status` (such as `LOGIN_REQUIRED`) alongside a
+/// localized `reason` so `needs_sign_in` still triggers for non-English locales.
+fn playability_error(r: &Value, label: Option<&str>) -> Option<anyhow::Error> {
+    let status = r.pointer("/playabilityStatus/status").and_then(Value::as_str).unwrap_or("");
+    if status == "OK" {
+        return None;
+    }
+    let reason = r.pointer("/playabilityStatus/reason").and_then(Value::as_str).unwrap_or("");
+    let detail = match (status.is_empty(), reason.is_empty()) {
+        (_, true) => status.to_string(),
+        (true, false) => reason.to_string(),
+        (false, false) if reason.eq_ignore_ascii_case(status) => reason.to_string(),
+        (false, false) => format!("{reason} ({status})"),
+    };
+    Some(match label {
+        Some(l) => anyhow!("{l}: {detail}"),
+        None => anyhow!("{detail}"),
+    })
 }
 
 fn parse_format(f: &Value) -> Option<StreamFormat> {
@@ -790,7 +805,13 @@ pub fn ytdlp_streams(video_id: &str) -> Result<StreamInfo> {
 /// a video only signed-in viewers may see.
 fn needs_sign_in(error: &str) -> bool {
     let e = error.to_ascii_lowercase();
-    e.contains("not a bot") || e.contains("confirm your age") || e.contains("login_required") || e.contains("sign in to") || e.contains("age-restricted") || e.contains("--cookies")
+    e.contains("not a bot")
+        || e.contains("confirm your age")
+        || e.contains("login_required")
+        || e.contains("age_check_required")
+        || e.contains("sign in to")
+        || e.contains("age-restricted")
+        || e.contains("--cookies")
 }
 
 /// yt-dlp with the browser sign-in's cookies, for videos YouTube only plays to a
@@ -1022,6 +1043,31 @@ pub fn pick_formats<'a>(
     (video, audio)
 }
 
+pub enum PlaybackStream<'a> {
+    Hls(&'a str),
+    Muxed(&'a StreamFormat),
+    Adaptive(Option<&'a StreamFormat>, Option<&'a StreamFormat>),
+}
+
+/// Pick the same media for background preloading and for the subsequent loadfile.
+pub fn playback_stream<'a>(
+    info: &'a StreamInfo,
+    quality: u32,
+    codec: &str,
+    language: Option<&str>,
+    audio_only: bool,
+) -> Option<PlaybackStream<'a>> {
+    if info.hls_only || info.is_live || (info.video.is_empty() && info.muxed.is_empty()) {
+        return info.hls_url.as_deref().map(PlaybackStream::Hls);
+    }
+    let (video, audio) = pick_formats(info, quality, codec, language);
+    let video = video.filter(|_| !audio_only);
+    if video.is_none() && audio.is_none() {
+        return info.muxed.last().map(PlaybackStream::Muxed);
+    }
+    Some(PlaybackStream::Adaptive(video, audio))
+}
+
 /// Builds a URL mpv can play: EDL combining separate video & audio streams.
 pub fn mpv_source(video: Option<&StreamFormat>, audio: Option<&StreamFormat>, duration: u64) -> Option<String> {
     let _ = duration;
@@ -1163,5 +1209,39 @@ mod kids_tests {
         // a regular video still goes through visionOS
         let regular = super::resolve("dQw4w9WgXcQ").unwrap();
         assert_eq!(regular.source, "visionos");
+    }
+}
+
+#[cfg(test)]
+mod playability_tests {
+    use super::{needs_sign_in, playability_error};
+    use serde_json::json;
+
+    #[test]
+    fn localized_login_required_triggers_sign_in_fallback() {
+        let ru = json!({
+            "playabilityStatus": {
+                "status": "LOGIN_REQUIRED",
+                "reason": "Войдите в аккаунт, чтобы подтвердить, что вы не бот"
+            }
+        });
+        let err = playability_error(&ru, Some("visionOS")).unwrap().to_string();
+        assert!(err.contains("Войдите в аккаунт"), "keeps localized reason: {err}");
+        assert!(needs_sign_in(&err), "must match LOGIN_REQUIRED: {err}");
+
+        let age = json!({
+            "playabilityStatus": {
+                "status": "AGE_CHECK_REQUIRED",
+                "reason": "Подтвердите свой возраст"
+            }
+        });
+        let err = playability_error(&age, None).unwrap().to_string();
+        assert!(needs_sign_in(&err), "must match AGE_CHECK_REQUIRED: {err}");
+    }
+
+    #[test]
+    fn ok_playability_has_no_error() {
+        let ok = json!({ "playabilityStatus": { "status": "OK" } });
+        assert!(playability_error(&ok, Some("visionOS")).is_none());
     }
 }

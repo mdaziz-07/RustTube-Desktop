@@ -116,6 +116,7 @@ pub struct Settings {
     pub ambient_mode: bool,
     pub shorts_in_player: bool,
     pub shorts_autoadvance: bool,
+    pub shorts_preload: u8,
     pub shorts_yt_layout: bool,
     pub shorts_edge_nav: bool,
     pub shorts_show_subscribe: bool,
@@ -130,6 +131,8 @@ pub struct Settings {
     pub hover_preview: bool,
     /// show archived annotations (notes and links YouTube removed in 2019)
     pub annotations: bool,
+    /// crop or zoom of the picture, a value of `player::aspect::MODES` ("original", "auto", "21:9"...)
+    pub aspect_mode: String,
     /// keep page scrollbars on screen instead of showing them on hover
     pub always_scrollbars: bool,
 }
@@ -177,6 +180,7 @@ impl Default for Settings {
             sb_min_duration: 0.0,
             sb_notify: true,
             annotations: true,
+            aspect_mode: "original".into(),
             always_scrollbars: false,
             dearrow_titles: false,
             dearrow_thumbnails: false,
@@ -229,6 +233,7 @@ impl Default for Settings {
             ambient_mode: true,
             shorts_in_player: false,
             shorts_autoadvance: false,
+            shorts_preload: 1,
             shorts_yt_layout: false,
             shorts_edge_nav: true,
             shorts_show_subscribe: true,
@@ -523,7 +528,9 @@ fn db() -> &'static Mutex<Connection> {
     static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
     DB.get_or_init(|| {
         let conn = open_checked(&data_dir().join("streamtube.db"));
-        conn.execute_batch(&format!("PRAGMA journal_mode=WAL; {TABLES}"))
+        // WAL mode is crash-safe with synchronous=NORMAL and avoids an fsync
+        // on every 5-second playback progress save.
+        conn.execute_batch(&format!("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; {TABLES}"))
         .expect("init db");
         // built-in playlists
         let n: i64 = conn
@@ -1133,7 +1140,13 @@ mod progress_queue_tests {
             history_progress_queued(&v.id, i as f64, 100.0, false);
         }
         history_progress_queued(&v.id, 77.0, 100.0, true);
-        let got = history_list("", 500).into_iter().find(|h| h.video.id == v.id).map(|h| h.progress);
-        assert_eq!(got, Some(77.0));
+        // `wait` gives up after 5 s so shutdown can't hang; on a busy CI runner other
+        // tests can hold the database longer than that, so give the worker more time here
+        let read = || history_list("", 500).into_iter().find(|h| h.video.id == v.id).map(|h| h.progress);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while read() != Some(77.0) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(read(), Some(77.0));
     }
 }

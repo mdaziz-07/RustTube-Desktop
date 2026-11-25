@@ -16,31 +16,42 @@ enum Kind {
     Live,
 }
 
+#[derive(Clone, Default)]
+struct FeedSnapshot {
+    videos: Arc<[VideoItem]>,
+    updated_at: Option<i64>,
+}
+
+struct AccountFeed {
+    session: Arc<()>,
+    snapshot: FeedSnapshot,
+}
+
 pub struct FeedPage {
-    videos: Vec<VideoItem>,
+    feed: FeedSnapshot,
+    account_feed: Option<AccountFeed>,
     profile: Option<i64>,
     kind: Kind,
     refreshing: bool,
     progress: Arc<(AtomicUsize, AtomicUsize)>,
     scroll: ScrollHandle,
-    last_updated: Option<i64>,
     shown: usize,
 }
 
 impl FeedPage {
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut s = Self {
-            videos: Vec::new(),
+            feed: FeedSnapshot::default(),
+            account_feed: None,
             profile: None,
             kind: Kind::All,
             refreshing: false,
             progress: Arc::new((AtomicUsize::new(0), AtomicUsize::new(0))),
             scroll: ScrollHandle::new(),
-            last_updated: None,
             shown: 60,
         };
         s.load_cached();
-        let stale = s.last_updated.map(|t| crate::api::json::now() - t > 30 * 60).unwrap_or(true);
+        let stale = s.feed.updated_at.map(|t| crate::api::json::now() - t > 30 * 60).unwrap_or(true);
         if crate::api::auth::signed_in() || (stale && !store::subscriptions().is_empty()) {
             s.refresh(cx);
         }
@@ -52,10 +63,52 @@ impl FeedPage {
     }
 
     fn load_cached(&mut self) {
+        if self.profile.is_none() {
+            if let Some(account_feed) = &self.account_feed {
+                self.feed = account_feed.snapshot.clone();
+                return;
+            }
+        }
         let f = self.filter();
-        let (v, at) = crate::feed::cached_feed(f.as_deref());
-        self.videos = v;
-        self.last_updated = at;
+        let (videos, updated_at) = crate::feed::cached_feed(f.as_deref());
+        self.feed = FeedSnapshot { videos: videos.into(), updated_at };
+    }
+
+    fn clear_stale_account_feed(&mut self) {
+        if let Some(feed) = &self.account_feed {
+            let current = crate::api::auth::session_identity();
+            if current.as_ref().is_none_or(|session| !Arc::ptr_eq(session, &feed.session)) {
+                self.account_feed = None;
+                if self.profile.is_none() {
+                    self.load_cached();
+                }
+            }
+        }
+    }
+
+    fn select_profile(&mut self, profile: Option<i64>, cx: &mut Context<Self>) {
+        if self.profile == profile {
+            return;
+        }
+        self.clear_stale_account_feed();
+        self.profile = profile;
+        self.load_cached();
+        if profile.is_none() && self.account_feed.is_none() && crate::api::auth::signed_in() {
+            self.refresh(cx);
+        }
+        cx.notify();
+    }
+
+    fn receive_feed(&mut self, profile: Option<i64>, snapshot: FeedSnapshot, session: Option<Arc<()>>) {
+        if let Some(session) = session {
+            self.account_feed = Some(AccountFeed { session, snapshot: snapshot.clone() });
+        }
+        if profile == self.profile {
+            self.feed = match (&self.account_feed, profile) {
+                (Some(feed), None) => feed.snapshot.clone(),
+                _ => snapshot,
+            };
+        }
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -64,8 +117,10 @@ impl FeedPage {
         }
         self.refreshing = true;
         self.progress.0.store(0, Ordering::SeqCst);
+        let profile = self.profile;
         let filter = self.filter();
-        let account = crate::api::auth::signed_in() && filter.is_none();
+        let session = if profile.is_none() { crate::api::auth::session_identity() } else { None };
+        let account = session.is_some();
         self.progress.1.store(if account { 0 } else { store::subscriptions().len() }, Ordering::SeqCst);
         let prog = self.progress.clone();
         // UI ticker for progress
@@ -85,7 +140,7 @@ impl FeedPage {
         })
         .detach();
         cx.spawn(async move |this, cx| {
-            let res = blocking(move || {
+            let (videos, failed, from_account) = blocking(move || {
                 // signed in: the account's own subscriptions feed, one request instead of one per channel
                 if account {
                     if let Ok(mut v) = crate::api::auth::subscriptions_videos(4) {
@@ -93,22 +148,35 @@ impl FeedPage {
                             // it isn't in date order, and the day headings repeat
                             // ("Yesterday", "This week", "Yesterday") unless it is
                             crate::feed::sort_feed(&mut v);
-                            return (v, 0);
+                            return (v, 0, true);
                         }
                     }
                 }
-                crate::feed::refresh(filter, move |d, t| {
+                let (videos, failed) = crate::feed::refresh(filter, move |d, t| {
                     prog.0.store(d, Ordering::SeqCst);
                     prog.1.store(t, Ordering::SeqCst);
-                })
+                });
+                (videos, failed, false)
             })
             .await;
             let _ = this.update(cx, |this, cx| {
                 this.refreshing = false;
-                this.videos = res.0;
-                this.last_updated = Some(crate::api::json::now());
-                if res.1 > 0 {
-                    toast(cx, tf!("{0} channels could not be refreshed", res.1));
+                this.clear_stale_account_feed();
+                let account_session = session.filter(|session| {
+                    crate::api::auth::session_identity().is_some_and(|current| Arc::ptr_eq(session, &current))
+                });
+                if !from_account || account_session.is_some() {
+                    let snapshot = FeedSnapshot {
+                        videos: videos.into(),
+                        updated_at: Some(crate::api::json::now()),
+                    };
+                    this.receive_feed(profile, snapshot, if from_account { account_session } else { None });
+                }
+                if profile.is_some() && this.profile.is_none() && this.account_feed.is_none() && crate::api::auth::signed_in() {
+                    this.refresh(cx);
+                }
+                if failed > 0 && profile == this.profile {
+                    toast(cx, tf!("{0} channels could not be refreshed", failed));
                 }
                 cx.notify();
             });
@@ -120,9 +188,10 @@ impl FeedPage {
 
 impl Render for FeedPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.clear_stale_account_feed();
         let p = pal(cx);
         let s = store::settings_snapshot();
-        if near_bottom(&self.scroll, 800.0) && self.shown < self.videos.len() {
+        if near_bottom(&self.scroll, 800.0) && self.shown < self.feed.videos.len() {
             self.shown += 60;
         }
         let width = content_width(cx);
@@ -147,16 +216,12 @@ impl Render for FeedPage {
         }
         let profiles = store::profiles();
         let mut bar = div().flex().items_center().gap_2().flex_wrap().child(chip("pf-all", t("All channels"), self.profile.is_none(), cx).on_click(cx.listener(|t, _, _, cx| {
-            t.profile = None;
-            t.load_cached();
-            cx.notify();
+            t.select_profile(None, cx);
         })));
         for pr in &profiles {
             let id = pr.id;
             bar = bar.child(chip(SharedString::from(format!("pf-{id}")), pr.name.clone(), self.profile == Some(id), cx).on_click(cx.listener(move |t, _, _, cx| {
-                t.profile = Some(id);
-                t.load_cached();
-                cx.notify();
+                t.select_profile(Some(id), cx);
             })));
         }
         bar = bar.child(div().w(px(1.)).h_6().bg(p.border).mx_2());
@@ -182,7 +247,7 @@ impl Render for FeedPage {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .when_some(self.last_updated.filter(|_| !self.refreshing), |d, t| d.child(div().text_xs().text_color(p.text2).child(tf!("Updated {0}", crate::api::json::relative_from_ts(t)))))
+                    .when_some(self.feed.updated_at.filter(|_| !self.refreshing), |d, t| d.child(div().text_xs().text_color(p.text2).child(tf!("Updated {0}", crate::api::json::relative_from_ts(t)))))
                     .when(self.refreshing, |d| d.child(div().text_xs().text_color(p.text2).child(if total == 0 { t("Refreshing…").to_string() } else { tf!("Refreshing {0}/{1}…", done, total) })))
                     .child(
                         pill("hide-watched", Some(if s.hide_watched_in_feed { "eye-off" } else { "eye" }), if s.hide_watched_in_feed { "Watched hidden" } else { "Hide watched" }, cx).on_click(|_, _, cx| {
@@ -195,6 +260,7 @@ impl Render for FeedPage {
             );
         let kind = self.kind;
         let vids: Vec<&VideoItem> = self
+            .feed
             .videos
             .iter()
             .filter(|v| !store::is_filtered(v, &s))
@@ -254,6 +320,43 @@ impl Render for FeedPage {
             col.into_any_element()
         };
         page_scroll("feed-scroll", &self.scroll).child(div().px_6().pt_4().pb_24().child(header).child(body)).into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod feed_selection_tests {
+    use super::{Arc, AtomicUsize, FeedPage, FeedSnapshot, Kind, ScrollHandle, VideoItem};
+
+    fn feed(id: &str) -> FeedSnapshot {
+        FeedSnapshot {
+            videos: vec![VideoItem { id: id.to_string(), ..Default::default() }].into(),
+            updated_at: Some(1),
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn account_feed_survives_profile_switches_and_local_fallback() {
+        let mut page = FeedPage {
+            feed: feed("filtered"),
+            account_feed: None,
+            profile: Some(1),
+            kind: Kind::All,
+            refreshing: false,
+            progress: Arc::new((AtomicUsize::new(0), AtomicUsize::new(0))),
+            scroll: ScrollHandle::new(),
+            shown: 60,
+        };
+
+        page.receive_feed(None, feed("account"), Some(Arc::new(())));
+        assert_eq!(page.feed.videos[0].id, "filtered");
+
+        page.profile = None;
+        page.load_cached();
+        assert_eq!(page.feed.videos[0].id, "account");
+
+        page.receive_feed(Some(1), feed("late-filtered"), None);
+        page.receive_feed(None, FeedSnapshot::default(), None);
+        assert_eq!(page.feed.videos[0].id, "account");
     }
 }
 

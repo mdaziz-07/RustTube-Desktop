@@ -3,7 +3,7 @@ use crate::i18n::t;
 use crate::api::json::compact_number;
 use crate::api::services;
 use crate::api::types::*;
-use crate::player::controller::player;
+use crate::player::controller::{PlayerEvent, player};
 use crate::store;
 use crate::ui::app::{Route, UiState, navigate};
 use crate::ui::*;
@@ -12,12 +12,22 @@ use crate::ui::widgets::{Load, comment_body};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+const SLIDE_DURATION: Duration = Duration::from_millis(280);
+
+struct ShortSlide {
+    previous: usize,
+    started: Instant,
+    frame: Option<Arc<RenderImage>>,
+}
+
 pub struct ShortsPage {
     list: Vec<VideoItem>,
     idx: usize,
     loading: bool,
+    initial_play: bool,
+    next_meta: Option<String>,
     votes: HashMap<String, services::Votes>,
-    last_step: Instant,
+    slide: Option<ShortSlide>,
     /// wheel / touchpad gesture tracking: one Short per gesture
     wheel_acc: f32,
     last_wheel: Instant,
@@ -40,12 +50,26 @@ pub struct ShortsPage {
 
 impl ShortsPage {
     pub fn new(start: Option<String>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let sub = cx.subscribe(&player(cx), |this: &mut Self, _, ev: &crate::player::controller::PlayerEvent, cx| {
-            if matches!(ev, crate::player::controller::PlayerEvent::Ended) && store::settings_snapshot().shorts_autoadvance {
-                this.advance(cx);
+        let sub = cx.subscribe(&player(cx), |this: &mut Self, pl, ev: &PlayerEvent, cx| {
+            if matches!(ev, PlayerEvent::Loaded) {
+                if let Some(short) = this.list.get_mut(this.idx).filter(|v| v.title.trim().is_empty()) {
+                    if let Some(video) = pl.read(cx).video.as_ref().filter(|v| v.id == short.id && !v.title.trim().is_empty()) {
+                        short.title.clone_from(&video.title);
+                        cx.notify();
+                    }
+                }
+            }
+            if matches!(ev, PlayerEvent::PlaybackReadyChanged) {
+                cx.notify();
+            }
+            if matches!(ev, PlayerEvent::Ended) && store::settings_snapshot().shorts_autoadvance {
+                if this.list.get(this.idx).zip(pl.read(cx).video.as_ref()).is_some_and(|(short, playing)| short.id == playing.id) {
+                    this.step(1, cx);
+                }
             }
         });
-        cx.on_release(|_, cx| {
+        cx.on_release(|this, cx| {
+            this.clear_slide(None, cx);
             let l = store::settings_snapshot().loop_video;
             player(cx).update(cx, |p, _| p.set_loop(l));
         })
@@ -54,8 +78,10 @@ impl ShortsPage {
             list: Vec::new(),
             idx: 0,
             loading: true,
+            initial_play: true,
+            next_meta: None,
             votes: HashMap::new(),
-            last_step: Instant::now(),
+            slide: None,
             wheel_acc: 0.0,
             last_wheel: Instant::now(),
             wheel_used: false,
@@ -80,18 +106,15 @@ impl ShortsPage {
                 _ => VideoItem { id: id.clone(), is_short: true, thumbnail: innertube::default_thumb(id), ..Default::default() },
             };
             s.list.push(item);
-            s.play_current(cx);
             Some(id.clone())
         } else if let Some(mut v) = cur_playing.filter(|v| v.is_short) {
             let id = v.id.clone();
             v.is_short = true;
             s.list.push(v);
-            s.play_current(cx);
             Some(id)
         } else {
             None
         };
-        let had_initial = initial_id.is_some();
         cx.spawn(async move |this, cx| {
             let res = blocking(move || {
                 // YouTube's own Shorts sequence: follow on from the opened/playing Short when present,
@@ -133,9 +156,7 @@ impl ShortsPage {
                 }
                 this.continuation = res.1;
                 this.reel_feed = res.2;
-                if !had_initial && !this.list.is_empty() {
-                    this.play_current(cx);
-                }
+
                 cx.notify();
             });
         })
@@ -144,6 +165,7 @@ impl ShortsPage {
     }
 
     fn play_current(&mut self, cx: &mut Context<Self>) {
+        self.initial_play = false;
         let Some(mut v) = self.list.get(self.idx).cloned() else { return };
         v.is_short = true;
         let pl = player(cx);
@@ -161,9 +183,6 @@ impl ShortsPage {
             }
         });
         self.fetch_meta(v.id.clone(), cx);
-        if let Some(n) = self.list.get(self.idx + 1) {
-            self.fetch_meta(n.id.clone(), cx);
-        }
         if self.show_comments {
             self.open_comments(cx);
         }
@@ -180,7 +199,11 @@ impl ShortsPage {
             })
             .detach();
         }
-        // prefetch more when near the end
+        self.load_more_if_needed(cx);
+        cx.notify();
+    }
+
+    fn load_more_if_needed(&mut self, cx: &mut Context<Self>) {
         if self.idx + 3 >= self.list.len() {
             if let Some(tok) = self.continuation.take() {
                 let reel = self.reel_feed;
@@ -209,8 +232,9 @@ impl ShortsPage {
                     if let Ok((items, cont)) = res {
                         let _ = this.update(cx, |t, cx| {
                             t.continuation = cont;
+                            let settings = store::settings_snapshot();
                             for v in items {
-                                if !t.list.iter().any(|x| x.id == v.id) {
+                                if !t.list.iter().any(|x| x.id == v.id) && !store::is_filtered(&VideoItem { is_short: false, ..v.clone() }, &settings) {
                                     t.list.push(v);
                                 }
                             }
@@ -221,7 +245,6 @@ impl ShortsPage {
                 .detach();
             }
         }
-        cx.notify();
     }
 
     fn fetch_meta(&mut self, id: String, cx: &mut Context<Self>) {
@@ -509,14 +532,6 @@ impl ShortsPage {
         div().flex().flex_col().child(el).child(col).into_any_element()
     }
 
-    fn advance(&mut self, cx: &mut Context<Self>) {
-        if self.idx + 1 < self.list.len() {
-            self.idx += 1;
-            self.last_step = Instant::now();
-            self.play_current(cx);
-        }
-    }
-
     fn render_comments(&mut self, h: Pixels, cx: &mut Context<Self>) -> AnyElement {
         let p = pal(cx);
         let ready = self.comments.as_ref().and_then(|c| c.ready());
@@ -610,71 +625,179 @@ impl ShortsPage {
             .into_any_element()
     }
 
-    pub fn step(&mut self, d: i32, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.last_step.elapsed() < Duration::from_millis(350) {
+    fn scroll_shorts(&mut self, ev: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A touchpad swipe is a stream of small deltas and a wheel notch one big one.
+        // Sum them, move one Short past a threshold, and ignore the rest of that
+        // gesture (it ends after a short pause).
+        if !cx.global::<UiState>().fullscreen && self.show_comments && self.comments_bounds.get().contains(&window.mouse_position()) {
             return;
         }
-        let n = self.idx as i32 + d;
-        if n < 0 || n as usize >= self.list.len() {
+        let dy: f32 = ev.delta.pixel_delta(window.line_height()).y.into();
+        if self.last_wheel.elapsed() > Duration::from_millis(220) {
+            self.wheel_acc = 0.0;
+            self.wheel_used = false;
+        }
+        self.last_wheel = Instant::now();
+        if self.wheel_used {
             return;
         }
-        self.last_step = Instant::now();
-        self.idx = n as usize;
+        self.wheel_acc += dy;
+        if self.wheel_acc.abs() >= 48.0 {
+            let d = if self.wheel_acc < 0.0 { 1 } else { -1 };
+            self.wheel_acc = 0.0;
+            self.wheel_used = true;
+            self.step(d, cx);
+        }
+    }
+
+    fn clear_slide(&mut self, window: Option<&mut Window>, cx: &mut App) {
+        if let Some(frame) = self.slide.take().and_then(|slide| slide.frame) {
+            cx.drop_image(frame, window);
+        }
+    }
+
+    pub fn step(&mut self, direction: i32, cx: &mut Context<Self>) {
+        let Some(next) = self.idx.checked_add_signed(direction as isize) else { return };
+        if next >= self.list.len() || self.slide.is_some() {
+            return;
+        }
+        if !cx.reduce_motion() {
+            let pl = player(cx);
+            let playing = pl.read(cx);
+            let frame = if !playing.audio_only && !playing.loading && playing.video.as_ref().is_some_and(|v| v.id == self.list[self.idx].id) {
+                playing.frame.clone()
+            } else {
+                None
+            };
+            self.slide = Some(ShortSlide { previous: self.idx, started: Instant::now(), frame });
+        }
+        self.idx = next;
         self.play_current(cx);
     }
 }
 
 impl Render for ShortsPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = pal(cx);
         let ui = *cx.global::<UiState>();
+        let pl = player(cx);
+        let playing = pl.read(cx);
+        let ready = playing.playback_ready && self.list.get(self.idx).zip(playing.video.as_ref()).is_some_and(|(short, video)| short.id == video.id);
+        crate::player::shorts_preload::update(&self.list[self.idx..], playing.quality, playing.audio_only, ready);
+        if self.initial_play && !self.list.is_empty() {
+            // Let the page paint before initializing mpv, including when opening a Short by URL.
+            cx.on_next_frame(window, |page, _, cx| {
+                if page.initial_play && crate::ui::app::is_current_page(cx.entity_id(), cx) {
+                    page.play_current(cx);
+                }
+            });
+        }
+        if ready {
+            if let Some(id) = self.list.get(self.idx + 1).map(|v| &v.id).filter(|id| self.next_meta.as_ref() != Some(*id)).cloned() {
+                self.next_meta = Some(id.clone());
+                self.fetch_meta(id, cx);
+            }
+        }
+        if !self.initial_play || self.list.is_empty() {
+            self.load_more_if_needed(cx);
+        }
         if self.list.is_empty() {
             crate::ui::slot::clear_slot(cx);
-            return div().size_full().child(if self.loading { spinner(cx).into_any_element() } else { empty_state("zap", "No Shorts found", "", cx).into_any_element() }).into_any_element();
+            return div().size_full().flex().items_center().justify_center().child(if self.loading { spinner(cx).into_any_element() } else { empty_state("zap", "No Shorts found", "", cx).into_any_element() }).into_any_element();
         }
         let v = self.list[self.idx].clone();
+        let rem = window.rem_size();
+        let yt_layout = store::settings_snapshot().shorts_yt_layout;
+        let available_h = if ui.fullscreen { ui.viewport.height.max(px(240.)) } else { (ui.viewport.height - px(88.)).max(px(400.)) };
+        let video_w = available_h * (9. / 16.);
+        // Use the space beside the video first. On small windows give the title its own row.
+        let side_space = if ui.fullscreen {
+            (ui.viewport.width - video_w) * 0.5 - rem * 2.
+        } else {
+            let comments_w = if self.show_comments { px(380.) + rem } else { px(0.) };
+            ui.content_width - video_w - comments_w - rem * 9.
+        };
+        let below = side_space < rem * 8. && (ui.fullscreen || !yt_layout);
+        let info_width = if yt_layout { px(250.) } else { side_space.min(px(250.)) };
+        let compact_channel = below && !ui.fullscreen && !v.channel_name.is_empty();
+        let caption_h = rem * if compact_channel { 4.5 } else { 3.5 };
+        let h = if below { available_h - caption_h } else { available_h };
+        let w = (h * (9. / 16.)).min(ui.viewport.width);
+        let title = |color: Hsla| {
+            div().min_w_0().text_base().font_weight(FontWeight::SEMIBOLD).text_color(color).line_clamp(if below { 2 } else { 4 }).child(v.title.clone())
+        };
+        let video_column = |video: Div| {
+            div().w(w).min_w_0().flex().flex_col().child(video).when(below, |d| {
+                d.child(
+                    div().w_full().h(caption_h).pt_1()
+                        .child(title(if ui.fullscreen { white() } else { p.text }))
+                        .when(compact_channel, |d| {
+                            let channel = v.channel_id.clone();
+                            d.child(div().id("shorts-caption-channel").text_xs().text_color(p.text2).truncate().child(v.channel_name.clone())
+                                .when_some(channel, |d, id| d.cursor_pointer().on_click(move |_, window, cx| navigate(Route::Channel(id.clone()), window, cx))))
+                        }),
+                )
+            })
+        };
+        // Warm the next cover in the same cache the player uses while waiting for its first frame.
+        if let Some(next) = self.list.get(self.idx + 1).filter(|_| ready) {
+            let images = cx.global::<image_cache::Images>().0.clone();
+            images.update(cx, |cache, cx| {
+                cache.load(&Resource::Uri(next.thumbnail.clone().into()), window, cx);
+            });
+        }
+        let mut offset = px(0.);
+        let mut outgoing = None;
+        if let Some(slide) = &self.slide {
+            let progress = slide.started.elapsed().as_secs_f32() / SLIDE_DURATION.as_secs_f32();
+            if progress < 1. && !cx.reduce_motion() {
+                let stride = (h + px(16.)) * if self.idx > slide.previous { 1. } else { -1. };
+                offset = stride * (1. - ease_in_out(progress));
+                let old = &self.list[slide.previous];
+                let (source, fit) = match slide.frame.as_ref() {
+                    Some(frame) => (ImageSource::Render(frame.clone()), ObjectFit::Contain),
+                    None => (ImageSource::from(old.thumbnail.clone()), ObjectFit::Cover),
+                };
+                outgoing = Some(
+                    div()
+                        .absolute()
+                        .top(offset - stride)
+                        .size_full()
+                        .when(!ui.fullscreen, |d| d.rounded_xl())
+                        .overflow_hidden()
+                        .bg(black())
+                        .child(img(source).absolute().size_full().object_fit(fit)),
+                );
+                window.request_animation_frame();
+            } else {
+                self.clear_slide(Some(window), cx);
+            }
+        }
+        let cards = div().relative().w(w).h(h).children(outgoing);
+        let current = div()
+            .absolute()
+            .top(offset)
+            .size_full()
+            .when(!ui.fullscreen, |d| d.rounded_xl())
+            .overflow_hidden()
+            .bg(black())
+            .child(crate::ui::slot::player_slot(cx));
         if ui.fullscreen {
-            let h = ui.viewport.height.max(px(240.));
-            let w = (h * (9. / 16.)).min(ui.viewport.width);
             return div()
                 .id("shorts-fs")
+                .relative()
                 .size_full()
                 .bg(black())
                 .flex()
                 .items_center()
                 .justify_center()
-                .on_scroll(cx.listener(|this, ev: &ScrollEvent, window, cx| {
-                    let dy: f32 = ev.delta.pixel_delta(window.line_height()).y.into();
-                    if this.last_wheel.elapsed() > Duration::from_millis(220) {
-                        this.wheel_acc = 0.0;
-                        this.wheel_used = false;
-                    }
-                    this.last_wheel = Instant::now();
-                    if this.wheel_used {
-                        return;
-                    }
-                    this.wheel_acc += dy;
-                    if this.wheel_acc.abs() >= 48.0 {
-                        let d = if this.wheel_acc < 0.0 { 1 } else { -1 };
-                        this.wheel_acc = 0.0;
-                        this.wheel_used = true;
-                        this.last_step = Instant::now() - Duration::from_secs(1);
-                        this.step(d, window, cx);
-                    }
-                }))
-                .child(
-                    div()
-                        .relative()
-                        .w(w)
-                        .h(h)
-                        .overflow_hidden()
-                        .bg(black())
-                        .child(crate::ui::slot::player_slot(cx)),
-                )
+                .on_scroll(cx.listener(Self::scroll_shorts))
+                .when(!below, |d| d.child(
+                    div().absolute().right((ui.viewport.width + w) * 0.5 + rem).bottom_4().w(side_space.min(px(250.))).child(title(white())),
+                ))
+                .child(video_column(cards.child(current)))
                 .into_any_element();
         }
-        let h = (ui.viewport.height - px(56. + 32.)).max(px(400.));
-        let w = h * (9. / 16.);
         let votes = self.votes.get(&v.id).cloned();
         let cid = v.channel_id.clone();
         let watch_id = v.id.clone();
@@ -695,14 +818,13 @@ impl Render for ShortsPage {
         let can_up = self.idx > 0;
         let can_down = self.idx + 1 < self.list.len();
         let st = store::settings_snapshot();
-        let yt_layout = st.shorts_yt_layout;
         let edge_nav = yt_layout && st.shorts_edge_nav;
         let show_subscribe = yt_layout && st.shorts_show_subscribe;
         let show_dislike = !yt_layout || st.shorts_show_dislike;
         let dislike_btn = show_dislike.then(|| {
             action("sh-dislike", "thumbs-down", votes.as_ref().map(|v| compact_number(v.dislikes)).unwrap_or_else(|| t("Dislike").into()), cx)
         });
-        let yt_info_panel = yt_layout.then(|| {
+        let info_panel = (!below).then(|| {
             let meta = self.meta.get(&v.id);
             let cid_yt = cid.clone();
             let ch = meta
@@ -725,12 +847,12 @@ impl Render for ShortsPage {
             } else {
                 None
             };
-            let meta_line = meta.and_then(|m| {
+            let meta_line = meta.filter(|_| yt_layout).and_then(|m| {
                 let parts: Vec<&str> = [m.views_text.as_str(), m.date_text.as_str()].into_iter().filter(|s| !s.is_empty()).collect();
                 (!parts.is_empty()).then(|| parts.join(" • "))
             });
             div()
-                .w(px(250.))
+                .w(info_width)
                 .min_w_0()
                 .h(h)
                 .flex()
@@ -761,7 +883,7 @@ impl Render for ShortsPage {
                         ),
                 )
                 .when_some(sub_btn, |d, btn| d.child(div().flex().items_center().child(btn)))
-                .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(p.text).line_clamp(4).child(v.title.clone()))
+                .child(title(p.text))
                 .when_some(meta_line, |d, t| d.child(div().text_xs().text_color(p.text2).child(t)))
         });
         div()
@@ -771,72 +893,12 @@ impl Render for ShortsPage {
             .flex()
             .items_center()
             .justify_center()
+            // Balance the wider title column when there is room beside the controls.
+            .when(!below && !self.show_comments, |d| d.pr((side_space - info_width).clamp(px(0.), rem * 4.)))
             .gap_4()
-            .on_scroll(cx.listener(|this, ev: &ScrollEvent, window, cx| {
-                // A touchpad swipe is a stream of small deltas and a wheel notch one big one.
-                // Sum them, move one Short past a threshold, and ignore the rest of that
-                // gesture (it ends after a short pause).
-                if this.show_comments && this.comments_bounds.get().contains(&window.mouse_position()) {
-                    return;
-                }
-                let dy: f32 = ev.delta.pixel_delta(window.line_height()).y.into();
-                if this.last_wheel.elapsed() > Duration::from_millis(220) {
-                    this.wheel_acc = 0.0;
-                    this.wheel_used = false;
-                }
-                this.last_wheel = Instant::now();
-                if this.wheel_used {
-                    return;
-                }
-                this.wheel_acc += dy;
-                if this.wheel_acc.abs() >= 48.0 {
-                    let d = if this.wheel_acc < 0.0 { 1 } else { -1 };
-                    this.wheel_acc = 0.0;
-                    this.wheel_used = true;
-                    this.last_step = Instant::now() - Duration::from_secs(1);
-                    this.step(d, window, cx);
-                }
-            }))
-            .when_some(yt_info_panel, |d, panel| d.child(panel))
-            .child(
-                div()
-                    .relative()
-                    .w(w)
-                    .h(h)
-                    .rounded_xl()
-                    .overflow_hidden()
-                    .bg(black())
-                    .child(crate::ui::slot::player_slot(cx))
-                    .when(!yt_layout, |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .right_0()
-                                .bottom(px(70.))
-                                .px_4()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .id("sh-chan")
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .cursor_pointer()
-                                        .on_click(move |_, window, cx| {
-                                            if let Some(c) = cid.clone() {
-                                                navigate(Route::Channel(c), window, cx);
-                                            }
-                                        })
-                                        .child(avatar(v.channel_avatar.as_deref(), px(32.), &v.channel_name, cx))
-                                        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(white()).child(v.channel_name.clone())),
-                                )
-                                .child(div().text_sm().text_color(white()).line_clamp(2).child(v.title.clone())),
-                        )
-                    }),
-            )
+            .on_scroll(cx.listener(Self::scroll_shorts))
+            .children(info_panel)
+            .child(video_column(cards.child(current)))
             .child(
                 div()
                     .flex()
@@ -879,8 +941,8 @@ impl Render for ShortsPage {
                     .flex_col()
                     .gap_4()
                     .when(edge_nav, |d| d.absolute().right(px(24.)).top_0().bottom_0().justify_center())
-                    .child(icon_button("sh-up", "arrow-up", cx).size_12().bg(p.chip).when(!can_up, |d| d.opacity(0.3)).on_click(cx.listener(|t, _, window, cx| t.step(-1, window, cx))))
-                    .child(icon_button("sh-down", "arrow-down", cx).size_12().bg(p.chip).when(!can_down, |d| d.opacity(0.3)).on_click(cx.listener(|t, _, window, cx| t.step(1, window, cx)))),
+                    .child(icon_button("sh-up", "arrow-up", cx).size_12().bg(p.chip).when(!can_up, |d| d.opacity(0.3)).on_click(cx.listener(|t, _, _, cx| t.step(-1, cx))))
+                    .child(icon_button("sh-down", "arrow-down", cx).size_12().bg(p.chip).when(!can_down, |d| d.opacity(0.3)).on_click(cx.listener(|t, _, _, cx| t.step(1, cx)))),
             )
             .into_any_element()
     }

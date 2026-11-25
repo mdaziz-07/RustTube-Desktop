@@ -438,7 +438,7 @@ impl SettingsPage {
             };
             (name.to_string(), credit.to_string(), selected, language)
         }).collect();
-        self.select("app-language", label, 280., items, |s, v| s.app_language = v, cx)
+        self.select("app-language", label, 280., items, set_app_language, cx)
     }
 
     /// A dropdown button: `items` are (label, detail, active, value).
@@ -580,6 +580,18 @@ impl SettingsPage {
         let s = store::settings_snapshot();
         card(cx)
             .child(row("Shorts: play next automatically", "Move to the next Short when one ends", switch("sha", s.shorts_autoadvance, |s, v| s.shorts_autoadvance = v, cx), cx))
+            .child(row(
+                "Preload upcoming Shorts",
+                "Buffer the start of this many videos ahead of playback",
+                self.choice(
+                    "shorts-preload",
+                    &[(0, "Off"), (1, "1"), (2, "2"), (3, "3"), (4, "4"), (5, "5")],
+                    s.shorts_preload.min(crate::player::shorts_preload::MAX_AHEAD),
+                    |s, v| s.shorts_preload = v,
+                    cx,
+                ),
+                cx,
+            ))
             .child(row("Open Shorts in the regular player", "", switch("shp", s.shorts_in_player, |s, v| s.shorts_in_player = v, cx), cx))
             .child(row(
                 "YouTube-style Shorts layout",
@@ -669,6 +681,12 @@ impl SettingsPage {
                 "Default quality",
                 "Maximum resolution to start videos at",
                 self.choice("q", &[(2160u32, "4K"), (1440, "1440p"), (1080, "1080p"), (720, "720p"), (480, "480p"), (360, "360p")], s.default_quality, |s, v| s.default_quality = v, cx),
+                cx,
+            ))
+            .child(row(
+                "Aspect ratio",
+                "Crop the black bars of letterboxed films to fill an ultrawide screen, or zoom the picture. Z changes it while watching",
+                self.choice("aspect", &crate::player::aspect::MODES.iter().map(|&(v, l)| (v.to_string(), l)).collect::<Vec<_>>(), s.aspect_mode.clone(), |s, v| s.aspect_mode = v, cx),
                 cx,
             ))
             .child(row("Preferred codec", "", self.choice("codec", &[("vp9".to_string(), "VP9"), ("av1".to_string(), "AV1"), ("h264".to_string(), "H.264")], s.codec_pref.clone(), |s, v| s.codec_pref = v, cx), cx))
@@ -1367,5 +1385,36 @@ mod tests {
     fn settings_search_accepts_dotted_and_dotless_i() {
         assert_eq!(settings_search_text("İzleme"), "izleme");
         assert_eq!(settings_search_text("AYARI"), settings_search_text("ayarı"));
+    }
+}
+
+/// Changes the app language. The YouTube and caption languages follow it while
+/// they still match the previous app language, so a separate choice is kept (#122).
+fn set_app_language(s: &mut Settings, language: AppLanguage) {
+    let old = s.app_language.code();
+    if s.language.eq_ignore_ascii_case(old) {
+        s.language = language.code().to_string();
+    }
+    if s.captions_lang.eq_ignore_ascii_case(old) {
+        s.captions_lang = language.code().to_string();
+    }
+    s.app_language = language;
+}
+
+#[cfg(test)]
+mod app_language_tests {
+    use super::{AppLanguage, Settings, set_app_language};
+
+    #[test]
+    fn youtube_and_caption_languages_follow_unless_chosen_separately() {
+        let mut s = Settings::default();
+        set_app_language(&mut s, AppLanguage::Russian);
+        assert_eq!((s.language.as_str(), s.captions_lang.as_str()), ("ru", "ru"));
+
+        // captions set to something else on purpose stay as they are
+        s.captions_lang = "ja".into();
+        set_app_language(&mut s, AppLanguage::German);
+        assert_eq!((s.language.as_str(), s.captions_lang.as_str()), ("de", "ja"));
+        assert_eq!(s.app_language, AppLanguage::German);
     }
 }

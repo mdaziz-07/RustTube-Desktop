@@ -46,7 +46,7 @@ impl AppLanguage {
         (Self::ChineseTraditional, "繁體中文"),
     ];
 
-    fn code(self) -> &'static str {
+    pub fn code(self) -> &'static str {
         match self {
             Self::English => "en",
             Self::Russian => "ru",

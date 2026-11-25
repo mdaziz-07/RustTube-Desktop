@@ -61,6 +61,93 @@ pub fn close(window: &mut Window, cx: &mut App) {
     cx.refresh_windows();
 }
 
+/// Starts moving the window under the pointer, as if its title bar was pressed.
+/// GPUI's Windows backend has no `start_window_move`, so Windows asks the
+/// system directly. The request is posted, not sent: the system's move loop
+/// must start from the message loop, not inside this event handler (it calls
+/// back into GPUI, which is busy handling the event).
+pub(crate) fn begin_window_move(window: &Window) {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        #[repr(C)]
+        struct Pt {
+            x: i32,
+            y: i32,
+        }
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn ReleaseCapture() -> i32;
+            fn GetCursorPos(p: *mut Pt) -> i32;
+            fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+        }
+        const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+        const HTCAPTION: usize = 2;
+        if let Ok(h) = HasWindowHandle::window_handle(window) {
+            if let RawWindowHandle::Win32(w) = h.as_raw() {
+                // SAFETY: plain Win32 calls on a live window owned by this process
+                unsafe {
+                    let mut p = Pt { x: 0, y: 0 };
+                    GetCursorPos(&mut p);
+                    let lparam = ((p.y as u16 as isize) << 16) | (p.x as u16 as isize);
+                    ReleaseCapture();
+                    PostMessageW(w.hwnd.get(), WM_NCLBUTTONDOWN, HTCAPTION, lparam);
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    window.start_window_move();
+}
+
+/// The PiP window was closed some other way (e.g. Alt+F4): forget it so the
+/// main window shows the video again.
+pub fn window_closed(id: WindowId, cx: &mut App) {
+    if handle(cx).is_some_and(|h| h.window_id() == id) {
+        cx.set_global(PipWindow(None));
+        cx.refresh_windows();
+    }
+}
+
+/// What the main window shows where the player sits: the video, or while
+/// the PiP window plays it, a placeholder (like YouTube) so the picture
+/// isn't drawn twice.
+pub(super) fn main_surface(view: &Entity<PlayerView>, cx: &App) -> super::slot::SlotFollower {
+    let content = if handle(cx).is_some() { placeholder().into_any_element() } else { view.clone().into_any_element() };
+    super::slot::SlotFollower::new(cx, content)
+}
+
+fn placeholder() -> impl IntoElement {
+    div()
+        .size_full()
+        .bg(black())
+        .text_color(white())
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_3()
+        .child(icon("picture-in-picture").size_8())
+        .child(crate::i18n::t("Playing in picture-in-picture").to_string())
+        .child(
+            div()
+                .id("return-from-pip")
+                .px_4()
+                .py_2()
+                .rounded_full()
+                .bg(hsla(0., 0., 1., 0.15))
+                .hover(|s| s.bg(hsla(0., 0., 1., 0.25)))
+                .cursor_pointer()
+                .text_sm()
+                .child(crate::i18n::t("Return to player").to_string())
+                .on_click(|_, _, cx| {
+                    if let Some(h) = handle(cx) {
+                        let _ = h.update(cx, |_, window, cx| close(window, cx));
+                    }
+                }),
+        )
+}
+
 impl Render for PipView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()

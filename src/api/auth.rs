@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 // Public OAuth client of the YouTube TV app.
 const CLIENT_ID: &str = "861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com";
@@ -30,6 +31,8 @@ struct Stored {
     refresh_token: String,
     expires_at: i64,
     account: Option<Account>,
+    #[serde(skip)]
+    session: Arc<()>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +58,14 @@ fn persist(s: &Option<Stored>) {
 
 pub fn signed_in() -> bool {
     state().lock().as_ref().map(|s| !s.refresh_token.is_empty()).unwrap_or(false)
+}
+
+pub(crate) fn session_identity() -> Option<Arc<()>> {
+    state()
+        .lock()
+        .as_ref()
+        .filter(|s| !s.refresh_token.is_empty())
+        .map(|s| s.session.clone())
 }
 
 pub fn account() -> Option<Account> {
@@ -126,6 +137,7 @@ pub fn poll_login(dc: &DeviceCode) -> Result<PollResult> {
             refresh_token: refresh.to_string(),
             expires_at: crate::api::json::now() + expires - 60,
             account: None,
+            session: Arc::new(()),
         });
         persist(&s);
     }

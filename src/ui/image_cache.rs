@@ -74,8 +74,7 @@ pub fn thumb_hover_bg(url: &str, dark: bool) -> Option<Hsla> {
     Some(h)
 }
 
-/// Web images are decoded no larger than this (Shorts covers come as 1080x1920,
-/// but are never drawn that big); every image stays decoded in memory.
+/// Web images are decoded no larger than this (keeping HD thumbnails sharp).
 const MAX_W: u32 = 1920;
 const MAX_H: u32 = 1080;
 
@@ -244,7 +243,7 @@ fn animated(bytes: &[u8]) -> Option<smallvec::SmallVec<[image::Frame; 1]>> {
 }
 
 /// Decoded images above this are freed, least recently shown first.
-const BUDGET_BYTES: usize = 160 * 1024 * 1024;
+const BUDGET_BYTES: usize = 96 * 1024 * 1024;
 
 struct Entry {
     item: Slot,

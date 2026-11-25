@@ -1,6 +1,6 @@
 [package]
 name = "streamtube"
-version = "0.7.4-alpha"
+version = "0.7.6-alpha"
 edition = "2024"
 description = "A YouTube desktop client in Rust + GPUI with SponsorBlock, DeArrow, RYD, local subscriptions & more"
 license = "MIT"
@@ -11,6 +11,7 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", features = ["json", "socks-proxy"] }
+url = "2"
 rusqlite = { version = "0.43", features = ["bundled"] }
 parking_lot = "0.12"
 sha2 = "0.11"
@@ -31,8 +32,8 @@ sha1 = "0.11"
 objc2 = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-# already in the tree through GPUI's Windows backend (same version and feature)
-windows = { version = "0.62", features = ["Win32_UI_WindowsAndMessaging"] }
+# already in the tree through GPUI's Windows backend
+windows = { version = "0.62", features = ["Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.dev.package."*"]
 opt-level = 2

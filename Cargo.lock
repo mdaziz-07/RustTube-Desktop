@@ -932,9 +932,9 @@ dependencies = [
 
 [[package]]
 name = "cookie"
-version = "0.18.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
 dependencies = [
  "percent-encoding",
  "time",
@@ -6078,7 +6078,7 @@ checksum = "d08889ec5408683408db66ad89e0e1f93dff55c73a4ccc71c427d5b277ee47e6"
 
 [[package]]
 name = "streamtube"
-version = "0.7.4-alpha"
+version = "0.7.6-alpha"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6101,6 +6101,7 @@ dependencies = [
  "sha2 0.11.1",
  "smallvec",
  "ureq",
+ "url",
  "windows 0.62.2",
 ]
 

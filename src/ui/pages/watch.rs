@@ -5,7 +5,7 @@ use crate::api::services::{self, Votes};
 use crate::api::types::*;
 use crate::player::controller::{PlayerEvent, player};
 use crate::store;
-use crate::ui::app::{AutoplayNext, MenuItem, Route, UiState, navigate, open_menu};
+use crate::ui::app::{AutoplayNext, Route, UiState, navigate, open_menu};
 use crate::ui::cards::*;
 use crate::ui::widgets::*;
 use crate::ui::*;
@@ -774,17 +774,7 @@ impl WatchPage {
                                 copy_to_clipboard(format!("https://youtu.be/{share_id}"), cx)
                             }))
                             .child(pill("w-dl", Some("download"), "Download", cx).on_click(move |ev, window, cx| {
-                                let items: Vec<MenuItem> = crate::downloads::FORMATS
-                                    .iter()
-                                    .map(|(f, label)| {
-                                        let v = v_dl.clone();
-                                        let f = f.to_string();
-                                        MenuItem::new(if f == "audio" { "music" } else { "film" }, *label, move |_, cx| {
-                                            crate::downloads::start(v.clone(), Some(f.clone()), cx)
-                                        })
-                                    })
-                                    .collect();
-                                open_menu(ev.position(), items, window, cx);
+                                open_menu(ev.position(), download_menu_items(&v_dl), window, cx);
                             }))
                             .child(pill("w-save", Some("bookmark"), "Save", cx).on_click(move |_, window, cx| {
                                 crate::ui::app::open_save_dialog(v_save.clone(), window, cx)
