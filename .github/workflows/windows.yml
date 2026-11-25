@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       package:
-        description: "Also build the installer and the zip"
+        description: "Also build the setup installer"
         type: boolean
         default: true
   # release.yml builds the release packages with this
@@ -109,23 +109,11 @@ jobs:
           }
           & $iscc /Q "/DAppVersion=$version" installer\streamtube.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
-
-          # zip: the app and libmpv, to run without installing
-          $name = "StreamTube-$version-windows-x64"
-          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
-          Copy-Item target/release/streamtube.exe, third_party/mpv/libmpv-2.dll, README.md "dist/$name/"
-          New-Item -ItemType Directory -Force "dist/$name/vulkan" | Out-Null
-          Copy-Item third_party/vulkan/vulkan-1.dll, third_party/vulkan/LICENSE.txt "dist/$name/vulkan/"
-          Copy-Item LICENSE "dist/$name/LICENSE.txt"
-          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
-          Remove-Item -Recurse "dist/$name"
           Get-ChildItem dist
 
       - uses: actions/upload-artifact@v4
         if: ${{ inputs.package || (github.event_name == 'push') }}
         with:
           name: StreamTube-windows-x64
-          path: |
-            dist/*-setup.exe
-            dist/*.zip
+          path: dist/*-setup.exe
           if-no-files-found: error

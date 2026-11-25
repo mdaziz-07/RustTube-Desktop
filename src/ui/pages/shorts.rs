@@ -386,23 +386,29 @@ impl ShortsPage {
         };
         let toggle = c.replies_token.clone().filter(|_| !is_reply && !c.reply_count.is_empty() && c.reply_count != "0").map(|tok| {
             let cid2 = cid.clone();
-            div()
-                .id(SharedString::from(format!("scr-btn-{}", c.id)))
-                .flex()
-                .items_center()
-                .gap_1()
-                .text_color(p.link)
-                .font_weight(FontWeight::MEDIUM)
-                .cursor_pointer()
-                .child(icon(if open { "chevron-up" } else { "chevron-down" }).size_4().text_color(p.link))
-                .child(format!("{} {}", c.reply_count, if c.reply_count == "1" { "reply" } else { "replies" }))
-                .on_click(cx.listener(move |t, _, _, cx| {
-                    if t.replies.remove(&cid2).is_some() {
-                        cx.notify();
-                    } else {
-                        t.load_replies(cid2.clone(), tok.clone(), cx);
-                    }
-                }))
+            div().flex().child(
+                div()
+                    .id(SharedString::from(format!("scr-btn-{}", c.id)))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_full()
+                    .text_color(p.link)
+                    .font_weight(FontWeight::MEDIUM)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(p.hover))
+                    .child(icon(if open { "chevron-up" } else { "chevron-down" }).size_4().text_color(p.link))
+                    .child(format!("{} {}", c.reply_count, if c.reply_count == "1" { "reply" } else { "replies" }))
+                    .on_click(cx.listener(move |t, _, _, cx| {
+                        if t.replies.remove(&cid2).is_some() {
+                            cx.notify();
+                        } else {
+                            t.load_replies(cid2.clone(), tok.clone(), cx);
+                        }
+                    })),
+            )
         });
         let el = div()
             .flex()

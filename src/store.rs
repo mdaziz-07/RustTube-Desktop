@@ -98,6 +98,7 @@ pub struct Settings {
     pub caption_edge: String,
     pub controls_hide_ms: u64,
     pub show_storyboard: bool,
+    pub related_thumb_width: f32,
     // SponsorBlock account (private ID, used for voting)
     pub sb_user_id: String,
     // Premium-style features
@@ -209,6 +210,7 @@ impl Default for Settings {
             caption_edge: "outline-shadow".into(),
             controls_hide_ms: 2500,
             show_storyboard: true,
+            related_thumb_width: 210.0,
             sb_user_id: String::new(),
             show_heatmap: true,
             jump_ahead: true,
@@ -308,6 +310,11 @@ fn normalize_settings(s: &mut Settings) {
     s.ui_scale = s.ui_scale.clamp(0.75, 1.5);
     if s.ui_scale == 0.0 {
         s.ui_scale = 1.0;
+    }
+    if s.related_thumb_width <= 0.0 {
+        s.related_thumb_width = 210.0;
+    } else {
+        s.related_thumb_width = s.related_thumb_width.clamp(140.0, 320.0);
     }
 }
 

@@ -27,15 +27,17 @@ impl<T> Load<T> {
 pub fn page_scroll(id: &'static str, handle: &ScrollHandle) -> PageScroll {
     ACTIVE_PAGE.with(|a| *a.borrow_mut() = Some((id, handle.clone())));
     PageScroll {
+        id,
         inner: div().id(id).size_full().overflow_y_scroll().track_scroll(handle),
         handle: handle.clone(),
     }
 }
 
-/// A page's scroll area. The scrollbar is added after the page's content so it
-/// is drawn, and takes clicks, on top of it.
+/// A page's scroll area. The scrollbar is rendered as a stationary sibling overlay
+/// outside the scrolling container so the thumb tracks scroll position properly.
 #[derive(IntoElement)]
 pub struct PageScroll {
+    id: &'static str,
     inner: Stateful<Div>,
     handle: ScrollHandle,
 }
@@ -48,13 +50,30 @@ impl ParentElement for PageScroll {
 
 impl RenderOnce for PageScroll {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        use gpui_kit::component::scroll::{ScrollableElement as _, ScrollbarMode};
+        use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
         // on hover rather than only while scrolling, so it can be found without a wheel
         let mode = if crate::store::settings_snapshot().always_scrollbars { ScrollbarMode::Always } else { ScrollbarMode::Hover };
         if gpui_kit::component::Theme::global(cx).scrollbar_mode != mode {
             gpui_kit::component::Theme::set_scrollbar_mode(mode, cx);
         }
-        self.inner.vertical_scrollbar(&self.handle)
+        div()
+            .relative()
+            .flex_1()
+            .size_full()
+            .min_h_0()
+            .min_w_0()
+            .child(self.inner)
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .child(
+                        Scrollbar::vertical(&self.handle)
+                            .id((self.id, "sb"))
+                            .mode(mode)
+                            .viewport_from_layout(),
+                    ),
+            )
     }
 }
 

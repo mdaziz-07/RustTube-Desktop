@@ -6,6 +6,7 @@
 use super::mpv::{Mpv, MpvEvent};
 use crate::api::streams;
 use crate::store;
+use crate::ui::icon;
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use std::cell::Cell;
@@ -26,6 +27,11 @@ pub struct Preview {
     /// playback position and length of the preview, in seconds
     pub pos: f64,
     pub dur: f64,
+    /// stream info of the previewed video (for audio & captions)
+    info: Option<crate::api::types::StreamInfo>,
+    pub muted: bool,
+    pub captions_on: bool,
+    pub last_control_click: Option<std::time::Instant>,
     /// frames are shown only once the current file has started; until then mpv may
     /// still hand over frames of the previously hovered video
     ready: bool,
@@ -47,7 +53,20 @@ pub struct PreviewSlot(pub Rc<Cell<Option<Bounds<Pixels>>>>);
 impl Global for PreviewSlot {}
 
 pub fn init(cx: &mut App) {
-    let e = cx.new(|_| Preview { mpv: None, id: None, frame: None, old: Vec::new(), serial: 0, pos: 0.0, dur: 0.0, ready: false });
+    let e = cx.new(|_| Preview {
+        mpv: None,
+        id: None,
+        frame: None,
+        old: Vec::new(),
+        serial: 0,
+        pos: 0.0,
+        dur: 0.0,
+        info: None,
+        muted: true,
+        captions_on: false,
+        last_control_click: None,
+        ready: false,
+    });
     cx.set_global(PreviewHandle(e));
     cx.set_global(PreviewSlot::default());
 }
@@ -64,8 +83,16 @@ pub fn showing(cx: &App) -> Option<String> {
     })
 }
 
+/// Returns true if a preview overlay control (mute, captions, seek) was just clicked.
+pub fn consumed_click(cx: &App) -> bool {
+    cx.try_global::<PreviewHandle>()
+        .and_then(|h| h.0.read(cx).last_control_click)
+        .map(|t| t.elapsed() < Duration::from_millis(300))
+        .unwrap_or(false)
+}
+
 /// Called from thumbnails' hover handlers.
-pub fn hover(id: &str, hovered: bool, cx: &mut App) {
+pub fn hover(id: &str, hovered: bool, bounds: Option<Bounds<Pixels>>, cx: &mut App) {
     if cx.try_global::<PreviewHandle>().is_none() {
         return;
     }
@@ -87,12 +114,16 @@ pub fn hover(id: &str, hovered: bool, cx: &mut App) {
         }
     }
     let id = id.to_string();
-    if p.read(cx).id.as_deref() != Some(id.as_str()) {
-        cx.global::<PreviewSlot>().0.set(None);
+    let changed = p.read(cx).id.as_deref() != Some(id.as_str());
+    if changed || cx.global::<PreviewSlot>().0.get().is_none() {
+        cx.global::<PreviewSlot>().0.set(bounds);
     }
     let serial = p.update(cx, |p, cx| {
         p.serial += 1;
         if p.id.as_deref() != Some(id.as_str()) {
+            p.muted = true;
+            p.captions_on = false;
+            p.info = None;
             p.clear(cx);
         }
         p.id = Some(id.clone());
@@ -163,6 +194,48 @@ impl Preview {
         cx.notify();
     }
 
+    pub fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+        self.muted = !self.muted;
+        if let Some(m) = &self.mpv {
+            m.set_flag("mute", self.muted);
+            if !self.muted {
+                m.set_f64("volume", store::settings_snapshot().volume);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_captions(&mut self, cx: &mut Context<Self>) {
+        let has_caps = self.info.as_ref().map(|i| !i.captions.is_empty()).unwrap_or(false);
+        if !has_caps {
+            return;
+        }
+        self.captions_on = !self.captions_on;
+        self.apply_caption();
+        cx.notify();
+    }
+
+    fn apply_caption(&self) {
+        let Some(m) = &self.mpv else { return };
+        let _ = m.command(&["sub-remove"]);
+        if !self.captions_on || !self.ready {
+            m.set("sid", "no");
+            return;
+        }
+        if let Some(info) = &self.info {
+            let lang = store::settings_snapshot().captions_lang.clone();
+            let cap = info
+                .captions
+                .iter()
+                .find(|c| c.lang.starts_with(&lang) && !c.auto)
+                .or_else(|| info.captions.iter().find(|c| c.lang.starts_with(&lang)))
+                .or_else(|| info.captions.first());
+            if let Some(c) = cap {
+                let _ = m.command(&["sub-add", &c.url, "select", &c.name, &c.lang]);
+            }
+        }
+    }
+
     fn clear(&mut self, cx: &mut Context<Self>) {
         if let Some(m) = &self.mpv {
             let _ = m.command(&["stop"]);
@@ -170,6 +243,8 @@ impl Preview {
         self.pos = 0.0;
         self.dur = 0.0;
         self.ready = false;
+        self.info = None;
+        self.captions_on = false;
         let had = self.frame.is_some();
         if let Some(f) = self.frame.take() {
             self.old.push(f);
@@ -194,8 +269,9 @@ impl Preview {
             ("vo", "libmpv"),
             ("hwdec", "no"),
             ("mute", "yes"),
-            ("aid", "no"),
-            ("sid", "no"),
+            ("sub-auto", "no"),
+            ("sub-font-size", "48"),
+            ("sub-border-size", "2.5"),
             ("keep-open", "yes"),
             ("idle", "yes"),
             ("ytdl", "no"),
@@ -238,6 +314,11 @@ impl Preview {
                 let ok = this.update(cx, |p, cx| {
                     if started {
                         p.ready = p.id.is_some();
+                        if let Some(m) = &p.mpv {
+                            m.set_flag("mute", p.muted);
+                            m.set_f64("volume", store::settings_snapshot().volume);
+                        }
+                        p.apply_caption();
                     }
                     if frame {
                         p.on_frame(cx);
@@ -253,21 +334,24 @@ impl Preview {
     }
 
     fn start(&mut self, info: &crate::api::types::StreamInfo, cx: &mut Context<Self>) {
+        self.info = Some(info.clone());
         let src = if info.hls_only {
             info.hls_url.as_deref().map(|u| crate::player::proxy::local_hls(u, 360, None))
         } else if info.is_live || (info.video.is_empty() && info.muxed.is_empty()) {
             info.hls_url.clone()
         } else {
             let codec = store::settings_snapshot().codec_pref.clone();
-            let (v, _) = streams::pick_formats(info, 360, &codec, None);
+            let (v, a) = streams::pick_formats(info, 360, &codec, None);
             match v {
-                Some(v) => streams::mpv_source(Some(v), None, info.length_secs),
+                Some(v) => streams::mpv_source(Some(v), a, info.length_secs),
                 None => info.muxed.first().map(|m| m.url.clone()),
             }
         };
         let Some(src) = src else { return };
         let Some(m) = self.ensure_mpv(cx) else { return };
         self.ready = false;
+        m.set_flag("mute", self.muted);
+        m.set_f64("volume", store::settings_snapshot().volume);
         let _ = m.command(&["loadfile", &src, "replace", "-1", "pause=no"]);
     }
 
@@ -336,18 +420,107 @@ fn clock(secs: f64) -> String {
 
 impl Render for PreviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let radius = px(12. * store::settings_snapshot().thumb_radius / 12.);
+        let radius = px(store::settings_snapshot().thumb_radius);
         let accent = cx.try_global::<crate::ui::Pal>().map(|p| p.accent).unwrap_or(red());
-        let (frame, pos, dur) = {
+        let (frame, pos, dur, muted, captions_on, has_captions, vid) = {
             let p = self.preview.read(cx);
-            (p.frame.clone(), p.pos, p.dur)
+            (
+                p.frame.clone(),
+                p.pos,
+                p.dur,
+                p.muted,
+                p.captions_on,
+                p.info.as_ref().map(|i| !i.captions.is_empty()).unwrap_or(false),
+                p.id.clone().unwrap_or_default(),
+            )
         };
         let frac = if dur > 0.0 { (pos / dur).clamp(0.0, 1.0) as f32 } else { 0.0 };
         let scrubbing = self.scrubbing;
-        let fade_id = SharedString::from(format!("preview-in-{}", self.preview.read(cx).id.clone().unwrap_or_default()));
+        let fade_id = SharedString::from(format!("preview-in-{vid}"));
         let el = div().id("preview").group("preview").relative().size_full().rounded(radius).overflow_hidden().when_some(frame, |d, f| {
             d.bg(black())
-                .child(img(ImageSource::Render(f)).size_full().object_fit(ObjectFit::Cover))
+                .child(img(ImageSource::Render(f)).size_full().rounded(radius).object_fit(ObjectFit::Cover))
+                // top-right hover preview controls: 1. Sound, 2. Captions below it
+                .child(
+                    div()
+                        .absolute()
+                        .top_2()
+                        .right_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .id("preview-mute")
+                                .size_8()
+                                .rounded_md()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(hsla(0., 0., 0., 0.72))
+                                .hover(|s| s.bg(hsla(0., 0., 0., 0.9)))
+                                .cursor_pointer()
+                                .tooltip(move |window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new(if muted { "Unmute" } else { "Mute" }).build(window, cx)
+                                })
+                                .tooltip_show_delay(Duration::from_millis(600))
+                                .child(icon(if muted { "volume-x" } else { "volume-2" }).size_4().text_color(white()))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.preview.update(cx, |p, _| p.last_control_click = Some(std::time::Instant::now()));
+                                    }),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.preview.update(cx, |p, cx| {
+                                        p.last_control_click = Some(std::time::Instant::now());
+                                        p.toggle_mute(cx);
+                                    });
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("preview-cc")
+                                .size_8()
+                                .rounded_md()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(hsla(0., 0., 0., 0.72))
+                                .hover(|s| s.bg(hsla(0., 0., 0., 0.9)))
+                                .when(!has_captions, |d| d.opacity(0.45))
+                                .when(captions_on, |d| d.border_b_2().border_color(accent))
+                                .cursor_pointer()
+                                .tooltip(move |window, cx| {
+                                    let label = if !has_captions {
+                                        "No captions"
+                                    } else if captions_on {
+                                        "Turn off captions"
+                                    } else {
+                                        "Captions"
+                                    };
+                                    gpui_kit::component::tooltip::Tooltip::new(label).build(window, cx)
+                                })
+                                .tooltip_show_delay(Duration::from_millis(600))
+                                .child(icon(if captions_on { "captions" } else { "captions-off" }).size_4().text_color(white()))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.preview.update(cx, |p, _| p.last_control_click = Some(std::time::Instant::now()));
+                                    }),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.preview.update(cx, |p, cx| {
+                                        p.last_control_click = Some(std::time::Instant::now());
+                                        p.toggle_captions(cx);
+                                    });
+                                })),
+                        ),
+                )
                 // time left, bottom right (like the duration badge it covers)
                 .when(dur > 0.0, |d| {
                     d.child(
@@ -369,16 +542,18 @@ impl Render for PreviewView {
                     d.child(
                         div()
                             .id("preview-seek")
+                            .group("preview-seek-g")
                             .absolute()
                             .left_0()
                             .right_0()
                             .bottom_0()
-                            .h(px(14.))
+                            .h(px(16.))
                             .flex()
                             .items_end()
                             .cursor_pointer()
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, _, cx| {
                                 cx.stop_propagation();
+                                this.preview.update(cx, |p, _| p.last_control_click = Some(std::time::Instant::now()));
                                 this.scrubbing = true;
                                 this.seek_to(e.position.x, cx);
                             }))
@@ -393,19 +568,34 @@ impl Render for PreviewView {
                             }))
                             .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| {
                                 cx.stop_propagation();
+                                this.preview.update(cx, |p, _| p.last_control_click = Some(std::time::Instant::now()));
                                 this.scrubbing = false;
                                 cx.notify();
                             }))
-                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.preview.update(cx, |p, _| p.last_control_click = Some(std::time::Instant::now()));
+                            }))
                             .child(
                                 div()
+                                    .relative()
                                     .w_full()
                                     .h(px(if scrubbing { 6. } else { 4. }))
                                     .group_hover("preview-seek-g", |s| s.h(px(6.)))
                                     .bg(hsla(0., 0., 1., 0.35))
-                                    .child(div().h_full().w(relative(frac)).bg(accent)),
-                            )
-                            .group("preview-seek-g"),
+                                    .child(div().h_full().w(relative(frac)).bg(accent))
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .top(px(-3.))
+                                            .left(relative(frac))
+                                            .ml(px(-5.))
+                                            .size(px(10.))
+                                            .rounded_full()
+                                            .bg(accent)
+                                            .when(!scrubbing, |d| d.invisible().group_hover("preview-seek-g", |s| s.visible())),
+                                    ),
+                            ),
                     )
                 })
         });
@@ -413,13 +603,17 @@ impl Render for PreviewView {
     }
 }
 
-/// Placed inside every thumbnail: records its bounds when it's the one previewed.
-pub fn slot_marker(id: &str, cx: &App) -> impl IntoElement {
+/// Placed inside every thumbnail: records its bounds both locally (for immediate hover
+/// lookup on cached pages) and into `PreviewSlot` when it's the one previewed.
+pub fn slot_marker(id: &str, local_bounds: Option<Rc<Cell<Option<Bounds<Pixels>>>>>, cx: &App) -> impl IntoElement {
     let slot = cx.global::<PreviewSlot>().0.clone();
     let handle = cx.global::<PreviewHandle>().0.clone();
     let id = id.to_string();
     canvas(
         move |b, _, cx| {
+            if let Some(lb) = &local_bounds {
+                lb.set(Some(b));
+            }
             if handle.read(cx).id.as_deref() == Some(id.as_str()) {
                 slot.set(Some(b));
             }

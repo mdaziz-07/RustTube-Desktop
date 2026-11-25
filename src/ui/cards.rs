@@ -116,18 +116,31 @@ fn badge(v: &VideoItem, cx: &App) -> Option<AnyElement> {
 }
 
 pub fn thumbnail(v: &VideoItem, url: String, w: Pixels, h: Pixels, radius: Pixels, cx: &App) -> Div {
+    thumbnail_with_bounds(v, url, w, h, radius, None, cx)
+}
+
+fn thumbnail_with_bounds(
+    v: &VideoItem,
+    url: String,
+    w: Pixels,
+    h: Pixels,
+    radius: Pixels,
+    slot_bounds: Option<std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>>,
+    cx: &App,
+) -> Div {
     let p = pal(cx);
     let progress = watched_progress(&v.id, cx);
+    let r = radius * (store::settings_snapshot().thumb_radius / 12.0);
     div()
         .relative()
         .w(w)
         .h(h)
         .flex_none()
-        .rounded(radius * (store::settings_snapshot().thumb_radius / 12.0))
+        .rounded(r)
         .overflow_hidden()
         .bg(p.surface)
-        .child(img(SharedString::from(url)).size_full().object_fit(ObjectFit::Cover))
-        .child(crate::player::preview::slot_marker(&v.id, cx))
+        .child(img(SharedString::from(url)).size_full().rounded(r).object_fit(ObjectFit::Cover))
+        .child(crate::player::preview::slot_marker(&v.id, slot_bounds, cx))
         .children(badge(v, cx))
         .when_some(progress.filter(|p| *p > 0.01), |d, pr| {
             d.child(
@@ -240,13 +253,13 @@ fn watch_route(v: &VideoItem) -> Route {
 
 /// Starts resolving a video's streams when the pointer rests on its thumbnail,
 /// so playback begins almost immediately on click.
-fn prefetch_hover(id: &str) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+fn prefetch_hover(id: &str, slot_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
     let id = id.to_string();
     move |hovered, _, cx| {
         if *hovered {
             crate::api::streams::prefetch_on_hover(&id);
         }
-        crate::player::preview::hover(&id, *hovered, cx);
+        crate::player::preview::hover(&id, *hovered, slot_bounds.get(), cx);
     }
 }
 
@@ -261,17 +274,22 @@ pub fn video_card(v: &VideoItem, width: Pixels, show_channel: bool, cx: &mut App
     let channel_route = v.channel_id.clone().map(Route::Channel);
     let meta = meta_line(v);
     let show_avatar = show_channel && !store::settings_snapshot().hide_channel_avatars;
+    let slot_bounds = std::rc::Rc::new(std::cell::Cell::new(None));
     div()
         .id(SharedString::from(format!("vc-{}", v.id)))
-        .on_hover(prefetch_hover(&v.id))
+        .on_hover(prefetch_hover(&v.id, slot_bounds.clone()))
         .flex()
         .flex_col()
         .w(width)
         .gap_3()
         .cursor_pointer()
         .group("card")
-        .on_click(move |_, window, cx| navigate(route.clone(), window, cx))
-        .child(thumbnail(v, thumb, width, h, px(12.), cx))
+        .on_click(move |_, window, cx| {
+            if !crate::player::preview::consumed_click(cx) {
+                navigate(route.clone(), window, cx);
+            }
+        })
+        .child(thumbnail_with_bounds(v, thumb, width, h, px(12.), Some(slot_bounds), cx))
         .child(
             div()
                 .flex()
@@ -378,15 +396,20 @@ pub fn video_row(v: &VideoItem, thumb_w: Pixels, cx: &mut App) -> AnyElement {
     let route = watch_route(v);
     let channel_route = v.channel_id.clone().map(Route::Channel);
     let meta = meta_line(v);
+    let slot_bounds = std::rc::Rc::new(std::cell::Cell::new(None));
     div()
         .id(SharedString::from(format!("vr-{}", v.id)))
-        .on_hover(prefetch_hover(&v.id))
+        .on_hover(prefetch_hover(&v.id, slot_bounds.clone()))
         .flex()
         .gap_4()
         .w_full()
         .cursor_pointer()
-        .on_click(move |_, window, cx| navigate(route.clone(), window, cx))
-        .child(thumbnail(v, thumb, thumb_w, thumb_w * (9. / 16.), px(12.), cx))
+        .on_click(move |_, window, cx| {
+            if !crate::player::preview::consumed_click(cx) {
+                navigate(route.clone(), window, cx);
+            }
+        })
+        .child(thumbnail_with_bounds(v, thumb, thumb_w, thumb_w * (9. / 16.), px(12.), Some(slot_bounds), cx))
         .child(
             div()
                 .flex()
@@ -436,9 +459,12 @@ pub fn compact_row(v: &VideoItem, active: bool, on_click: Option<Arc<dyn Fn(&mut
     let p = pal(cx);
     let (title, thumb) = branded(v, cx);
     let route = watch_route(v);
+    let thumb_w = px(store::settings_snapshot().related_thumb_width);
+    let thumb_h = thumb_w * (9. / 16.);
+    let slot_bounds = std::rc::Rc::new(std::cell::Cell::new(None));
     div()
         .id(SharedString::from(format!("cr-{}", v.id)))
-        .on_hover(prefetch_hover(&v.id))
+        .on_hover(prefetch_hover(&v.id, slot_bounds.clone()))
         .flex()
         .gap_2()
         .w_full()
@@ -447,11 +473,16 @@ pub fn compact_row(v: &VideoItem, active: bool, on_click: Option<Arc<dyn Fn(&mut
         .cursor_pointer()
         .when(active, |d| d.bg(p.hover))
         .hover(move |s| s.bg(p.surface))
-        .on_click(move |_, window, cx| match &on_click {
-            Some(f) => f(window, cx),
-            None => navigate(route.clone(), window, cx),
+        .on_click(move |_, window, cx| {
+            if crate::player::preview::consumed_click(cx) {
+                return;
+            }
+            match &on_click {
+                Some(f) => f(window, cx),
+                None => navigate(route.clone(), window, cx),
+            }
         })
-        .child(thumbnail(v, thumb, px(168.), px(94.), px(8.), cx))
+        .child(thumbnail_with_bounds(v, thumb, thumb_w, thumb_h, px(8.), Some(slot_bounds), cx))
         .child(
             div()
                 .flex()
@@ -602,6 +633,7 @@ pub fn playlist_card(pl: &PlaylistItem, width: Pixels, cx: &mut App) -> AnyEleme
 
 pub fn playlist_thumb(thumb: Option<String>, count: Option<String>, w: Pixels, h: Pixels, cx: &App) -> Div {
     let p = pal(cx);
+    let r = px(store::settings_snapshot().thumb_radius);
     div()
         .relative()
         .w(w)
@@ -614,17 +646,17 @@ pub fn playlist_thumb(thumb: Option<String>, count: Option<String>, w: Pixels, h
                 .left(px(12.))
                 .right(px(12.))
                 .h_4()
-                .rounded_t_lg()
+                .rounded_t(r * 0.67)
                 .bg(p.hover),
         )
         .child(
             div()
                 .relative()
                 .size_full()
-                .rounded_xl()
+                .rounded(r)
                 .overflow_hidden()
                 .bg(p.surface)
-                .when_some(thumb, |d, t| d.child(img(SharedString::from(t)).size_full().object_fit(ObjectFit::Cover)))
+                .when_some(thumb, |d, t| d.child(img(SharedString::from(t)).size_full().rounded(r).object_fit(ObjectFit::Cover)))
                 .child(
                     div()
                         .absolute()

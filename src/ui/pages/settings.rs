@@ -650,6 +650,12 @@ impl SettingsPage {
             })
             .child(row("Preview", "", caption_preview(&s), cx))
             .child(row("Hide controls after", "", self.choice("hide", &[(1500u64, "1.5s"), (2500, "2.5s"), (4000, "4s"), (8000, "8s")], s.controls_hide_ms, |s, v| s.controls_hide_ms = v, cx), cx))
+            .child(row(
+                "Up next thumbnail size",
+                "Size of video thumbnails on the right side of the player",
+                self.choice("relthumb", &[(168.0f32, "Small"), (210.0, "Medium"), (250.0, "Large"), (290.0, "Extra large")], s.related_thumb_width, |s, v| s.related_thumb_width = v, cx),
+                cx,
+            ))
             .child(row("Seek bar preview thumbnails", "", switch("sbprev", s.show_storyboard, |s, v| s.show_storyboard = v, cx), cx))
             .child(row("Arrow key seek step", "", self.choice("step", &[(5.0f64, "5s"), (10.0, "10s"), (15.0, "15s"), (30.0, "30s")], s.seek_step, |s, v| s.seek_step = v, cx), cx))
             .child(row(
