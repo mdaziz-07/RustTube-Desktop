@@ -1,5 +1,6 @@
 //! Persistent storage: settings (JSON) + SQLite for subscriptions, history, playlists, caches.
 use crate::api::types::VideoItem;
+use crate::i18n::AppLanguage;
 use anyhow::Result;
 use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -13,6 +14,7 @@ use std::sync::{Arc, OnceLock};
 pub struct Settings {
     // Appearance
     pub theme: String,
+    pub app_language: AppLanguage,
     pub accent: u32,
     pub start_page: String,
     pub grid_columns: u32,
@@ -26,6 +28,7 @@ pub struct Settings {
     pub ytdlp_path: String,
     pub proxy: String,
     // Player
+    pub theater_mode: bool,
     pub default_quality: u32,
     pub codec_pref: String,
     pub default_speed: f64,
@@ -113,6 +116,10 @@ pub struct Settings {
     pub ambient_mode: bool,
     pub shorts_in_player: bool,
     pub shorts_autoadvance: bool,
+    pub shorts_yt_layout: bool,
+    pub shorts_edge_nav: bool,
+    pub shorts_show_subscribe: bool,
+    pub shorts_show_dislike: bool,
     pub remember_quality: bool,
     pub exit_fullscreen_at_end: bool,
     /// "light" | "default" | "strong": gradient behind the player controls
@@ -140,6 +147,7 @@ impl Default for Settings {
         }
         Self {
             theme: "dark".into(),
+            app_language: AppLanguage::default(),
             accent: 0xff0033,
             start_page: "home".into(),
             grid_columns: 0,
@@ -149,6 +157,7 @@ impl Default for Settings {
             display_server: "auto".into(),
             ytdlp_path: String::new(),
             proxy: String::new(),
+            theater_mode: false,
             default_quality: 1080,
             codec_pref: "vp9".into(),
             default_speed: 1.0,
@@ -220,6 +229,10 @@ impl Default for Settings {
             ambient_mode: true,
             shorts_in_player: false,
             shorts_autoadvance: false,
+            shorts_yt_layout: false,
+            shorts_edge_nav: true,
+            shorts_show_subscribe: true,
+            shorts_show_dislike: true,
             remember_quality: false,
             exit_fullscreen_at_end: true,
             controls_shade: "default".into(),
@@ -334,10 +347,6 @@ pub fn update_settings(f: impl FnOnce(&mut Settings)) {
     *settings_lock().write() = Arc::new(s);
 }
 
-pub fn ip_family() -> ureq::config::IpFamily {
-    if settings_snapshot().ipv4_only { ureq::config::IpFamily::Ipv4Only } else { ureq::config::IpFamily::Any }
-}
-
 /// Whether mpv can use this proxy itself (it only speaks HTTP proxies).
 pub fn mpv_http_proxy(p: &str) -> bool {
     let p = p.trim().to_ascii_lowercase();
@@ -349,6 +358,25 @@ pub fn proxy_setting() -> Option<String> {
     (!p.trim().is_empty()).then_some(p)
 }
 
+/// The profile holds the sign-in (OAuth tokens and Google cookies), so on Linux and
+/// macOS only its owner may open it: the folder is 0700 and the files already in it
+/// 0600. Windows keeps %APPDATA% per user already.
+#[cfg(unix)]
+fn make_private(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            if e.file_type().is_ok_and(|t| t.is_file()) {
+                let _ = std::fs::set_permissions(e.path(), std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn make_private(_dir: &std::path::Path) {}
+
 pub fn data_dir() -> PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
@@ -356,6 +384,7 @@ pub fn data_dir() -> PathBuf {
         if let Some(d) = std::env::var_os("STREAMTUBE_DATA_DIR").filter(|d| !d.is_empty()) {
             let d = PathBuf::from(d);
             let _ = std::fs::create_dir_all(&d);
+            make_private(&d);
             return d;
         }
         // tests never touch the real profile
@@ -373,6 +402,7 @@ pub fn data_dir() -> PathBuf {
             let _ = std::fs::rename(&old, &d);
         }
         let _ = std::fs::create_dir_all(&d);
+        make_private(&d);
         // A -wal/-shm left without its database belongs to some other copy of it;
         // SQLite would replay it onto whatever database is put there next and
         // damage it, so drop it before anything opens the database.
@@ -682,6 +712,35 @@ pub fn history_progress(video_id: &str, progress: f64, duration: f64) {
         "UPDATE history SET progress=?2, duration=?3 WHERE video_id=?1",
         params![video_id, progress, duration],
     );
+}
+
+/// Like `history_progress`, on a background thread: the player saves progress every
+/// few seconds, and a slow disk must not stall the UI thread (it draws the video).
+/// Writes keep their order; with `wait`, this returns once the write (and every
+/// one queued before it) is done.
+pub fn history_progress_queued(video_id: &str, progress: f64, duration: f64, wait: bool) {
+    type Job = (String, f64, f64, Option<std::sync::mpsc::Sender<()>>);
+    static WORKER: OnceLock<Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
+    let tx = WORKER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let _ = std::thread::Builder::new().name("history-progress".into()).spawn(move || {
+            for (id, p, d, done) in rx {
+                history_progress(&id, p, d);
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
+            }
+        });
+        Mutex::new(tx)
+    });
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    if tx.lock().send((video_id.to_string(), progress, duration, wait.then_some(done_tx))).is_err() {
+        history_progress(video_id, progress, duration);
+        return;
+    }
+    if wait {
+        let _ = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+    }
 }
 
 pub fn history_list(query: &str, limit: usize) -> Vec<HistoryEntry> {
@@ -1002,6 +1061,16 @@ mod settings_tests {
     use super::*;
 
     #[test]
+    fn theater_mode_round_trips_and_defaults_to_off() {
+        let old = settings_from_value(serde_json::json!({}));
+        assert!(!old.theater_mode);
+
+        let enabled = Settings { theater_mode: true, ..old };
+        let saved = serde_json::to_value(enabled).unwrap();
+        assert!(settings_from_value(saved).theater_mode);
+    }
+
+    #[test]
     fn a_bad_field_keeps_the_others() {
         let raw = serde_json::json!({
             "hide_shorts": true,
@@ -1049,5 +1118,22 @@ mod settings_tests {
         assert!(damaged, "the damaged file is kept");
         drop(c);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod progress_queue_tests {
+    use super::*;
+
+    #[test]
+    fn queued_progress_writes_land_in_order() {
+        let v = crate::api::types::VideoItem { id: "queued-progress".into(), ..Default::default() };
+        history_add(&v);
+        for i in 1..=50 {
+            history_progress_queued(&v.id, i as f64, 100.0, false);
+        }
+        history_progress_queued(&v.id, 77.0, 100.0, true);
+        let got = history_list("", 500).into_iter().find(|h| h.video.id == v.id).map(|h| h.progress);
+        assert_eq!(got, Some(77.0));
     }
 }

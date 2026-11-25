@@ -15,13 +15,44 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// How long the pointer has to rest on a thumbnail before the preview starts.
-const DELAY: Duration = Duration::from_millis(650);
+const DELAY: Duration = Duration::from_millis(100);
+
+#[derive(Clone)]
+pub struct Glimpse {
+    pub sb: crate::api::types::Storyboard,
+    pub steps: Vec<u32>,
+    pub step: usize,
+}
+
+impl Glimpse {
+    fn from_sb(sb: crate::api::types::Storyboard) -> Option<Self> {
+        let sheet_cap = (sb.cols * sb.rows).min(sb.count);
+        if sb.cols == 0 || sb.rows == 0 || sheet_cap == 0 {
+            return None;
+        }
+        let n = 10.min(sheet_cap as usize);
+        let steps: Vec<u32> = if sheet_cap == 1 {
+            vec![0]
+        } else {
+            (0..n).map(|i| ((i as u32 * (sheet_cap - 1)) / (n as u32 - 1).max(1)).min(sheet_cap - 1)).collect()
+        };
+        Some(Self { sb, steps, step: 0 })
+    }
+
+    fn current(&self) -> Option<(String, u32, u32)> {
+        let idx = *self.steps.get(self.step % self.steps.len().max(1))?;
+        let cols = self.sb.cols.max(1);
+        Some((self.sb.url_template.replace("$M", "0"), idx % cols, idx / cols))
+    }
+}
 
 pub struct Preview {
     mpv: Option<Arc<Mpv>>,
     /// video being previewed (or about to be)
     pub id: Option<String>,
     pub frame: Option<Arc<RenderImage>>,
+    /// Up Next storyboard glimpse (no video/audio playback)
+    pub glimpse: Option<Glimpse>,
     old: Vec<Arc<RenderImage>>,
     serial: u64,
     /// playback position and length of the preview, in seconds
@@ -57,6 +88,7 @@ pub fn init(cx: &mut App) {
         mpv: None,
         id: None,
         frame: None,
+        glimpse: None,
         old: Vec::new(),
         serial: 0,
         pos: 0.0,
@@ -75,11 +107,11 @@ pub fn preview(cx: &App) -> Entity<Preview> {
     cx.global::<PreviewHandle>().0.clone()
 }
 
-/// The id of the video currently previewed, once frames are showing.
+/// The id of the video currently previewed, once frames or a glimpse are showing.
 pub fn showing(cx: &App) -> Option<String> {
     cx.try_global::<PreviewHandle>().and_then(|h| {
         let p = h.0.read(cx);
-        p.frame.as_ref().and(p.id.clone())
+        if p.frame.is_some() || p.glimpse.is_some() { p.id.clone() } else { None }
     })
 }
 
@@ -146,6 +178,87 @@ pub fn hover(id: &str, hovered: bool, bounds: Option<Bounds<Pixels>>, cx: &mut A
             let Ok(info) = info else { return };
             p.update(cx, |p, cx| p.start(&info, cx));
         });
+    })
+    .detach();
+}
+
+/// Called from Up Next thumbnails on the watch page: shows a silent storyboard
+/// glimpse without playing the video or audio.
+pub fn hover_glimpse(id: &str, hovered: bool, bounds: Option<Bounds<Pixels>>, cx: &mut App) {
+    if cx.try_global::<PreviewHandle>().is_none() {
+        return;
+    }
+    let p = preview(cx);
+    if !hovered {
+        if p.read(cx).id.as_deref() == Some(id) {
+            stop(cx);
+        }
+        return;
+    }
+    if !store::settings_snapshot().hover_preview {
+        return;
+    }
+    let id = id.to_string();
+    let changed = p.read(cx).id.as_deref() != Some(id.as_str());
+    if changed || cx.global::<PreviewSlot>().0.get().is_none() {
+        cx.global::<PreviewSlot>().0.set(bounds);
+    }
+    let serial = p.update(cx, |p, cx| {
+        p.serial += 1;
+        if p.id.as_deref() != Some(id.as_str()) {
+            p.muted = true;
+            p.captions_on = false;
+            p.info = None;
+            p.clear(cx);
+        }
+        p.id = Some(id.clone());
+        p.serial
+    });
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(DELAY).await;
+        if !cx.update(|cx| preview(cx).read(cx).serial == serial) {
+            return;
+        }
+        let id2 = id.clone();
+        let info = crate::ui::blocking(move || streams::get_streams(&id2)).await;
+        let Ok(info) = info else { return };
+        let Some(glimpse) = info.storyboard.and_then(Glimpse::from_sb) else { return };
+        let ok = cx.update(|cx| {
+            let p = preview(cx);
+            if p.read(cx).serial != serial {
+                return false;
+            }
+            p.update(cx, |p, cx| {
+                p.glimpse = Some(glimpse);
+                cx.emit(PreviewEvent::Changed);
+                cx.notify();
+            });
+            true
+        });
+        if !ok {
+            return;
+        }
+        loop {
+            cx.background_executor().timer(Duration::from_millis(420)).await;
+            let keep = cx.update(|cx| {
+                let p = preview(cx);
+                if p.read(cx).serial != serial {
+                    return false;
+                }
+                p.update(cx, |p, cx| {
+                    if let Some(g) = &mut p.glimpse {
+                        g.step = (g.step + 1) % g.steps.len().max(1);
+                        cx.notify();
+                        true
+                    } else {
+                        false
+                    }
+                })
+            });
+            if !keep {
+                break;
+            }
+        }
     })
     .detach();
 }
@@ -217,6 +330,9 @@ impl Preview {
 
     fn apply_caption(&self) {
         let Some(m) = &self.mpv else { return };
+        super::controller::apply_caption_style_to(m);
+        m.set("sub-font-size", "48");
+        m.set("sub-margin-y", "24");
         let _ = m.command(&["sub-remove"]);
         if !self.captions_on || !self.ready {
             m.set("sid", "no");
@@ -245,7 +361,7 @@ impl Preview {
         self.ready = false;
         self.info = None;
         self.captions_on = false;
-        let had = self.frame.is_some();
+        let had = self.frame.is_some() || self.glimpse.take().is_some();
         if let Some(f) = self.frame.take() {
             self.old.push(f);
         }
@@ -296,6 +412,9 @@ impl Preview {
         })
         .ok()?;
         m.set_render_size(640, 360);
+        super::controller::apply_caption_style_to(&m);
+        m.set("sub-font-size", "48");
+        m.set("sub-margin-y", "24");
         self.mpv = Some(m.clone());
         cx.spawn(async move |this, cx| {
             use futures::StreamExt;
@@ -422,10 +541,12 @@ impl Render for PreviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let radius = px(store::settings_snapshot().thumb_radius);
         let accent = cx.try_global::<crate::ui::Pal>().map(|p| p.accent).unwrap_or(red());
-        let (frame, pos, dur, muted, captions_on, has_captions, vid) = {
+        let (frame, glimpse, pos, dur, muted, captions_on, has_captions, vid) = {
             let p = self.preview.read(cx);
+            let g_frame = p.glimpse.as_ref().and_then(|g| g.current().map(|(url, col, row)| (url, g.sb.cols, g.sb.rows, col, row)));
             (
                 p.frame.clone(),
+                g_frame,
                 p.pos,
                 p.dur,
                 p.muted,
@@ -434,6 +555,28 @@ impl Render for PreviewView {
                 p.id.clone().unwrap_or_default(),
             )
         };
+        if let (None, Some((url, cols, rows, col, row))) = (&frame, glimpse) {
+            let slot_size = cx.global::<PreviewSlot>().0.get().map(|b| b.size).unwrap_or(size(px(210.), px(118.)));
+            let r = px(8.) * (store::settings_snapshot().thumb_radius / 12.0);
+            let fade_id = SharedString::from(format!("glimpse-in-{vid}"));
+            return div()
+                .id("preview-glimpse")
+                .relative()
+                .size_full()
+                .rounded(r)
+                .overflow_hidden()
+                .bg(black())
+                .child(
+                    img(SharedString::from(url))
+                        .absolute()
+                        .left(-(slot_size.width * col as f32))
+                        .top(-(slot_size.height * row as f32))
+                        .w(slot_size.width * cols as f32)
+                        .h(slot_size.height * rows as f32),
+                )
+                .with_animation(fade_id, Animation::new(std::time::Duration::from_millis(160)).with_easing(ease_out_quint()), |d, t| d.opacity(t))
+                .into_any_element();
+        }
         let frac = if dur > 0.0 { (pos / dur).clamp(0.0, 1.0) as f32 } else { 0.0 };
         let scrubbing = self.scrubbing;
         let fade_id = SharedString::from(format!("preview-in-{vid}"));
@@ -600,6 +743,7 @@ impl Render for PreviewView {
                 })
         });
         el.with_animation(fade_id, Animation::new(std::time::Duration::from_millis(200)).with_easing(ease_out_quint()), |d, t| d.opacity(t))
+            .into_any_element()
     }
 }
 

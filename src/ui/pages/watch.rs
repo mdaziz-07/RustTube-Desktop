@@ -1,4 +1,5 @@
 use crate::api::innertube;
+use crate::i18n::{t as translate, tf};
 use crate::api::json::compact_number;
 use crate::api::services::{self, Votes};
 use crate::api::types::*;
@@ -50,6 +51,10 @@ pub struct WatchPage {
     related_more_loading: bool,
     scroll: ScrollHandle,
     local_playlist: Option<(i64, String, Vec<VideoItem>)>,
+    /// the queue list; it opens scrolled to the video playing (each video is a
+    /// new page, so its scroll position isn't kept)
+    queue_scroll: ScrollHandle,
+    queue_scrolled_to: Option<usize>,
     chat: Option<LiveChat>,
     /// repaints the chapters panel when playback moves into another chapter
     chapters_ticker: Option<Task<()>>,
@@ -133,6 +138,8 @@ impl WatchPage {
             related_more_loading: false,
             scroll: ScrollHandle::new(),
             local_playlist,
+            queue_scroll: ScrollHandle::new(),
+            queue_scrolled_to: None,
             chat: None,
             chapters_ticker: None,
             chapters_shown: None,
@@ -146,7 +153,7 @@ impl WatchPage {
 
     fn make_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let signed_in = crate::api::auth::signed_in();
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder(if signed_in { "Chat…" } else { "Sign in to chat" }));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(translate(if signed_in { "Chat…" } else { "Sign in to chat" })));
         let sub = cx.subscribe_in(&input, window, |this: &mut Self, st, ev: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { .. } = ev {
                 let text = st.read(cx).value().to_string();
@@ -241,7 +248,7 @@ impl WatchPage {
             return;
         }
         if !crate::api::auth::signed_in() {
-            toast(cx, "Sign in to chat");
+            toast(cx, translate("Sign in to chat"));
             return;
         }
         let Some(w) = self.info.ready() else { return };
@@ -260,7 +267,7 @@ impl WatchPage {
                     chat.sending = false;
                 }
                 if let Err(e) = res {
-                    toast(cx, format!("Message not sent: {e}"));
+                    toast(cx, tf!("Message not sent: {0}", e));
                 }
                 cx.notify();
             });
@@ -268,7 +275,7 @@ impl WatchPage {
         .detach();
     }
 
-    fn render_chat(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let live = self.info.ready().map(|w| w.live_chat.is_some()).unwrap_or(false);
         let p = pal(cx);
         let chat = self.chat.as_ref()?;
@@ -283,8 +290,8 @@ impl WatchPage {
             .py_2()
             .border_b_1()
             .border_color(p.border)
-            .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).text_color(p.text).child("Live chat"))
-            .child(chip("chat-top", "Top", chat.top, cx).on_click(cx.listener(|this, _, _, cx| {
+            .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(translate("Live chat")))
+            .child(chip("chat-top", translate("Top"), chat.top, cx).on_click(cx.listener(|this, _, _, cx| {
                 if let Some(c) = &mut this.chat {
                     if !c.top {
                         c.top = true;
@@ -292,7 +299,7 @@ impl WatchPage {
                     }
                 }
             })))
-            .child(chip("chat-all", "All", !chat.top, cx).on_click(cx.listener(|this, _, _, cx| {
+            .child(chip("chat-all", translate("All"), !chat.top, cx).on_click(cx.listener(|this, _, _, cx| {
                 if let Some(c) = &mut this.chat {
                     if c.top {
                         c.top = false;
@@ -315,7 +322,8 @@ impl WatchPage {
         }
         let mut list = div().id("chat-list").h(px(440.)).overflow_y_scroll().track_scroll(&chat.scroll).flex().flex_col().gap_1().px_3().py_2();
         if chat.messages.is_empty() {
-            list = list.child(div().py_6().flex().justify_center().text_sm().text_color(p.text2).child(chat.error.clone().unwrap_or_else(|| "Loading chat…".into())));
+            let status = chat.error.as_deref().unwrap_or("Loading chat…");
+            list = list.child(div().py_6().flex().justify_center().text_sm().text_color(p.text2).child(translate(status).to_string()));
         }
         for m in &chat.messages {
             let name_color = match m.role {
@@ -357,6 +365,7 @@ impl WatchPage {
             list = list.child(div().py_2().text_xs().text_color(p.text3).child(e.clone()));
         }
         let signed_in = crate::api::auth::signed_in();
+        localize_placeholder(&chat.input, if signed_in { "Chat…" } else { "Sign in to chat" }, window, cx);
         let input_row = div()
             .flex()
             .items_center()
@@ -381,16 +390,22 @@ impl WatchPage {
     fn load(&mut self, cx: &mut Context<Self>) {
         let id = self.id.clone();
         let pid = self.playlist_id.clone().filter(|p| !p.starts_with("local:"));
-        let ryd = store::settings_snapshot().ryd;
+        self.counted_rating = store::rating(&self.id);
+        if store::settings_snapshot().ryd {
+            let rating_id = id.clone();
+            cx.spawn(async move |this, cx| {
+                let votes = blocking(move || services::ryd_votes(&rating_id).ok()).await;
+                let _ = this.update(cx, |this, cx| {
+                    if store::settings_snapshot().ryd {
+                        this.votes = votes;
+                        cx.notify();
+                    }
+                });
+            }).detach();
+        }
         cx.spawn(async move |this, cx| {
-            let id2 = id.clone();
-            let info_f = blocking(move || innertube::watch_next(&id2, pid.as_deref()));
-            let id3 = id.clone();
-            let votes_f = blocking(move || if ryd { services::ryd_votes(&id3).ok() } else { None });
-            let (info, votes) = futures::join!(info_f, votes_f);
+            let info = blocking(move || innertube::watch_next(&id, pid.as_deref())).await;
             let _ = this.update(cx, |this, cx| {
-                this.votes = votes;
-                this.counted_rating = store::rating(&this.id);
                 match info {
                     Ok(w) => {
                         let s = store::settings_snapshot();
@@ -425,8 +440,7 @@ impl WatchPage {
                                 // playlist queue
                                 if let Some(wp) = &w.playlist {
                                     if !wp.items.is_empty() {
-                                        p.queue = wp.items.clone();
-                                        p.queue_pos = wp.items.iter().position(|x| x.id == full.id);
+                                        merge_playlist_window(&mut p.queue, &mut p.queue_pos, &wp.items, &full.id);
                                     }
                                 }
                                 cx.notify();
@@ -438,7 +452,7 @@ impl WatchPage {
                             .filter_map(|i| i.as_video())
                             .find(|v| !v.is_short && !v.is_live && !store::is_filtered(v, &s))
                             .cloned();
-                        if let Some(n) = &next {
+                        if let Some(n) = next.as_ref().filter(|_| s.autoplay_next) {
                             // warm up the autoplay candidate so the next video starts instantly
                             let id = n.id.clone();
                             std::thread::spawn(move || {
@@ -473,14 +487,14 @@ impl WatchPage {
         let looping = player(cx).read(cx).loop_video;
         if next.is_none() && !looping && s.exit_fullscreen_at_end && cx.global::<UiState>().fullscreen {
             if let Some(w) = cx.active_window() {
-                let _ = w.update(cx, |_, window, cx| crate::ui::app::toggle_fullscreen(window, cx));
+                let _ = w.update(cx, |_, window, cx| crate::ui::app::exit_fullscreen(window, cx));
             }
         }
         if !s.autoplay_next {
             return;
         }
         if let Some(v) = next {
-            toast(cx, format!("Up next: {}", v.title));
+            toast(cx, tf!("Up next: {0}", v.title));
             let id = v.id.clone();
             cx.spawn(async move |_, cx| {
                 cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
@@ -639,7 +653,7 @@ impl WatchPage {
         let likes = like_n
             .map(vote_count)
             .or_else(|| w.likes_text.clone().filter(|t| !t.chars().any(|c| c.is_ascii_digit())))
-            .unwrap_or_else(|| "Like".into());
+            .unwrap_or_else(|| translate("Like").into());
         let dislikes = dislike_n.map(vote_count);
         let ratio = like_n.zip(dislike_n).filter(|(l, d)| l + d > 0).map(|(l, d)| l as f32 / (l + d) as f32);
         let video_item = player(cx).read(cx).video.clone().unwrap_or_else(|| VideoItem { id: w.id.clone(), title: w.title.clone(), ..Default::default() });
@@ -826,7 +840,7 @@ impl WatchPage {
                                 .flex()
                                 .items_center()
                                 .justify_between()
-                                .child(div().text_base().font_weight(FontWeight::SEMIBOLD).text_color(p.text).child("Chapters"))
+                                .child(div().text_base().font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(translate("Chapters")))
                                 .child(
                                     div()
                                         .id("chap-all")
@@ -838,7 +852,7 @@ impl WatchPage {
                                         .text_color(p.link)
                                         .cursor_pointer()
                                         .hover(move |s| s.bg(p.hover))
-                                        .child("View all")
+                                        .child(translate("View all"))
                                         .on_click(|_, window, cx| {
                                             cx.stop_propagation();
                                             CHAPTERS_OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -877,7 +891,7 @@ impl WatchPage {
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(p.text)
                     .cursor_pointer()
-                    .child(if expanded { "Show less" } else { "...more" })
+                    .child(translate(if expanded { "Show less" } else { "...more" }))
                     .on_click(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
                         this.desc_expanded ^= true;
@@ -932,7 +946,7 @@ impl WatchPage {
                     .flex_1()
                     .min_w_0()
                     .gap_1()
-                    .when(c.is_pinned, |d| d.child(div().flex().items_center().gap_1().text_xs().text_color(p.text2).child(icon("pin").size_3()).child("Pinned")))
+                    .when(c.is_pinned, |d| d.child(div().flex().items_center().gap_1().text_xs().text_color(p.text2).child(icon("pin").size_3()).child(translate("Pinned"))))
                     .child(
                         div()
                             .flex()
@@ -1027,7 +1041,7 @@ impl WatchPage {
                                 .text_sm()
                                 .text_color(p.link)
                                 .cursor_pointer()
-                                .child("Show more replies")
+                                .child(translate("Show more replies"))
                                 .on_click(cx.listener(move |this, _, _, cx| this.load_replies(cid3.clone(), tok.clone(), cx)))
                                 .into_any_element(),
                             true,
@@ -1048,11 +1062,11 @@ impl WatchPage {
             return div().into_any_element();
         }
         let Some(state) = &self.comments else {
-            return div().py_4().text_sm().text_color(p.text2).child(if w.comments_token.is_none() { "Comments are turned off." } else { "" }).into_any_element();
+            return div().py_4().text_sm().text_color(p.text2).child(if w.comments_token.is_none() { translate("Comments are turned off.") } else { "" }).into_any_element();
         };
         let data = match state {
             Load::Loading => return spinner(cx).into_any_element(),
-            Load::Error(e) => return div().py_4().text_sm().text_color(p.text2).child(format!("Could not load comments: {e}")).into_any_element(),
+            Load::Error(e) => return div().py_4().text_sm().text_color(p.text2).child(tf!("Could not load comments: {0}", e)).into_any_element(),
             Load::Ready(c) => c.clone(),
         };
         let sort_new = self.comment_sort_new;
@@ -1065,25 +1079,25 @@ impl WatchPage {
                 .gap_6()
                 .child(div().text_xl().font_weight(FontWeight::BOLD).text_color(p.text).child({
                     let n = data.count_text.clone().or(w.comment_count_text.clone()).unwrap_or_default();
-                    if n.to_lowercase().contains("comment") { n } else { format!("{n} Comments").trim().to_string() }
+                    if n.to_lowercase().contains("comment") { n } else { tf!("{0} Comments", n).trim().to_string() }
                 }))
                 .child(
                     div()
                         .flex()
                         .gap_2()
                         .when_some(top, |d, t| {
-                            d.child(chip("c-top", "Top", !sort_new && !timed, cx).on_click(cx.listener(move |this, _, _, cx| {
+                            d.child(chip("c-top", translate("Top"), !sort_new && !timed, cx).on_click(cx.listener(move |this, _, _, cx| {
                                 this.comment_sort_new = false;
                                 this.set_timed(false, cx);
                                 this.load_comments(t.clone(), false, cx);
                             })))
                         })
-                        .child(chip("c-timed", "Timed", timed, cx).on_click(cx.listener(|this, _, _, cx| {
+                        .child(chip("c-timed", translate("Timed"), timed, cx).on_click(cx.listener(|this, _, _, cx| {
                             let on = !this.comment_timed;
                             this.set_timed(on, cx);
                         })))
                         .when_some(new, |d, t| {
-                            d.child(chip("c-new", "Newest", sort_new && !timed, cx).on_click(cx.listener(move |this, _, _, cx| {
+                            d.child(chip("c-new", translate("Newest"), sort_new && !timed, cx).on_click(cx.listener(move |this, _, _, cx| {
                                 this.comment_sort_new = true;
                                 this.set_timed(false, cx);
                                 this.load_comments(t.clone(), false, cx);
@@ -1102,14 +1116,14 @@ impl WatchPage {
             let later = total - reached.len();
             col = col.child(div().text_sm().text_color(p.text2).child(if total == 0 {
                 if data.continuation.is_some() && data.comments.len() < 400 {
-                    format!("Looking for comments with timestamps… ({} checked)", data.comments.len())
+                    tf!("Looking for comments with timestamps… ({0} checked)", data.comments.len())
                 } else {
-                    format!("None of the {} comments checked mention a timestamp.", data.comments.len())
+                    tf!("None of the {0} comments checked mention a timestamp.", data.comments.len())
                 }
             } else if reached.is_empty() {
-                format!("Comments appear here as the video reaches the moment they mention ({total} so far).")
+                tf!("Comments appear here as the video reaches the moment they mention ({0} so far).", total)
             } else if later > 0 {
-                format!("{later} more later in the video")
+                tf!("{0} more later in the video", later)
             } else {
                 String::new()
             }));
@@ -1254,7 +1268,7 @@ impl WatchPage {
                             div()
                                 .flex()
                                 .flex_col()
-                                .child(div().text_base().font_weight(FontWeight::BOLD).text_color(p.text).child("Chapters"))
+                                .child(div().text_base().font_weight(FontWeight::BOLD).text_color(p.text).child(translate("Chapters")))
                                 .child(div().text_xs().text_color(p.text2).child(format!("{} / {}", current.map(|c| c + 1).unwrap_or(0), chapters.len()))),
                         )
                         .child(icon_button("chp-close", "x", cx).on_click(|_, _, cx| {
@@ -1282,8 +1296,13 @@ impl WatchPage {
             .ready()
             .and_then(|w| w.playlist.as_ref().map(|p| p.title.clone()))
             .or(self.local_playlist.as_ref().map(|l| l.1.clone()))
-            .unwrap_or_else(|| "Queue".into());
-        let mut list = div().id("queue-list").flex().flex_col().max_h(px(400.)).overflow_y_scroll();
+            .unwrap_or_else(|| translate("Queue").into());
+        let mut list = div().id("queue-list").flex().flex_col().max_h(px(400.)).overflow_y_scroll().track_scroll(&self.queue_scroll);
+        if let Some(i) = pos.filter(|i| self.queue_scrolled_to != Some(*i)) {
+            self.queue_scrolled_to = Some(i);
+            // a row above the current one stays visible
+            self.queue_scroll.scroll_to_item(i.saturating_sub(1));
+        }
         for (i, v) in queue.iter().enumerate() {
             let plc = pl.clone();
             list = list.child(
@@ -1366,7 +1385,7 @@ impl WatchPage {
                 .items_center()
                 .justify_between()
                 .pb_1()
-                .child(div().text_base().font_weight(FontWeight::SEMIBOLD).text_color(p.text).child("Up next"))
+                .child(div().text_base().font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(translate("Up next")))
                 .child(
                     div()
                         .id("autoplay")
@@ -1376,11 +1395,11 @@ impl WatchPage {
                         .text_xs()
                         .text_color(p.text2)
                         .cursor_pointer()
-                        .child("Autoplay")
+                        .child(translate("Autoplay"))
                         .child(
                             div()
-                                .w(px(36.))
-                                .h(px(14.))
+                                .w(px(43.))
+                                .h(px(18.))
                                 .rounded_full()
                                 .bg(if autoplay { p.text2 } else { p.hover })
                                 .relative()
@@ -1443,10 +1462,12 @@ impl WatchPage {
 }
 
 impl Render for WatchPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf::add(&crate::perf::PAGE_RENDERS, 1);
         let p = pal(cx);
         let ui = *cx.global::<UiState>();
+        let settings = store::settings_snapshot();
+        let theater = settings.theater_mode;
         // infinite scroll: comments, then related
         if near_bottom(&self.scroll, 600.0) {
             if let Some(Load::Ready(c)) = &self.comments {
@@ -1471,7 +1492,7 @@ impl Render for WatchPage {
         let side_w = px((s.related_thumb_width + 234.0).clamp(402.0, 540.0));
         let two_col = avail > px(1000.);
         let primary_w = if two_col { (avail - side_w - px(24.)).min(px(1280.)) } else { avail };
-        let player_h = if ui.theater {
+        let player_h = if theater {
             (vp.width * (9. / 16.)).min(vp.height - px(56. + 120.))
         } else {
             primary_w * (9. / 16.)
@@ -1486,12 +1507,12 @@ impl Render for WatchPage {
                 let c = self.render_comments(w, cx);
                 div().flex().flex_col().child(i).child(c).into_any_element()
             }
-            (Load::Error(e), _) => div().py_4().text_color(p.text2).child(format!("Could not load video details: {e}")).into_any_element(),
+            (Load::Error(e), _) => div().py_4().text_color(p.text2).child(tf!("Could not load video details: {0}", e)).into_any_element(),
             _ => spinner(cx).into_any_element(),
         };
         let chapters_panel = self.render_chapters_panel(cx);
         let queue_panel = self.render_queue_panel(cx);
-        let chat_panel = self.render_chat(cx);
+        let chat_panel = self.render_chat(window, cx);
         let related = info.as_ref().map(|w| self.render_related(w, cx));
         let secondary = div()
             .flex()
@@ -1503,7 +1524,7 @@ impl Render for WatchPage {
             .children(queue_panel)
             .children(related);
         // ambient mode: a soft glow in the picture's colours around the player
-        let glow = (!ui.theater && store::settings_snapshot().ambient_mode)
+        let glow = (!theater && settings.ambient_mode)
             .then(|| crate::player::controller::player(cx).read(cx).ambient)
             .flatten()
             .map(|c| {
@@ -1512,16 +1533,16 @@ impl Render for WatchPage {
                 h
             });
         let player_box = div()
-            .w(if ui.theater { vp.width } else { primary_w })
+            .w(if theater { vp.width } else { primary_w })
             .h(player_h)
             .flex_none()
-            .when(!ui.theater, |d| d.rounded(px(s.thumb_radius)).overflow_hidden())
+            .when(!theater, |d| d.rounded(px(s.thumb_radius)).overflow_hidden())
             .when_some(glow, |d, color| {
                 d.shadow(vec![BoxShadow { color, offset: point(px(0.), px(0.)), blur_radius: px(90.), spread_radius: px(12.), inset: false }])
             })
             .child(crate::ui::slot::player_slot(cx));
 
-        let body = if ui.theater {
+        let body = if theater {
             div()
                 .flex()
                 .flex_col()
@@ -1581,7 +1602,7 @@ fn set_rating(id: &str, r: i8, cx: &mut App) {
         };
         cx.spawn(async move |cx| {
             if blocking(move || crate::api::auth::like(&id, kind)).await.is_err() {
-                let _ = cx.update(|cx| toast(cx, "Couldn't update the rating on your YouTube account"));
+                let _ = cx.update(|cx| toast(cx, translate("Couldn't update the rating on your YouTube account")));
             }
         })
         .detach();
@@ -1665,5 +1686,58 @@ mod tests {
         let p = reply_parents(&list);
         // index 3 is already three levels deep, so answers to it sit beside it
         assert_eq!(p, vec![None, Some(0), None, Some(1), None, Some(1), Some(1)]);
+    }
+}
+
+/// YouTube sends only a window of a playlist with each video (about 20 before it
+/// and 80 after). Replacing the queue with that window cut long playlists short
+/// and dropped the rest of a queue, so the window is merged in instead: a queue
+/// that already has this video keeps its order and gains the window's later
+/// videos it lacks, at its end; otherwise the window becomes the queue.
+fn merge_playlist_window(queue: &mut Vec<VideoItem>, pos: &mut Option<usize>, window: &[VideoItem], current: &str) {
+    let Some(at) = queue.iter().position(|v| v.id == current) else {
+        *queue = window.to_vec();
+        *pos = queue.iter().position(|v| v.id == current);
+        return;
+    };
+    *pos = Some(at);
+    let known: std::collections::HashSet<String> = queue.iter().map(|v| v.id.clone()).collect();
+    let later = window.iter().skip_while(|v| v.id != current).skip(1).filter(|v| !known.contains(&v.id)).cloned();
+    queue.extend(later.collect::<Vec<_>>());
+}
+
+#[cfg(test)]
+mod queue_merge_tests {
+    use super::*;
+
+    fn vids(ids: std::ops::Range<u32>) -> Vec<VideoItem> {
+        ids.map(|i| VideoItem { id: i.to_string(), ..Default::default() }).collect()
+    }
+
+    #[::core::prelude::v1::test]
+    fn a_window_extends_a_long_queue() {
+        let mut q = vids(0..300);
+        let mut pos = None;
+        merge_playlist_window(&mut q, &mut pos, &vids(279..378), "299");
+        assert_eq!(pos, Some(299));
+        assert_eq!(q.len(), 378);
+        assert_eq!(q[300].id, "300");
+    }
+
+    #[::core::prelude::v1::test]
+    fn a_window_never_shrinks_the_queue() {
+        let mut q = vids(0..10);
+        let mut pos = None;
+        merge_playlist_window(&mut q, &mut pos, &vids(3..5), "4");
+        assert_eq!((q.len(), pos), (10, Some(4)));
+    }
+
+    #[::core::prelude::v1::test]
+    fn a_new_playlist_replaces_the_queue() {
+        let mut q = vids(0..10);
+        let mut pos = None;
+        merge_playlist_window(&mut q, &mut pos, &vids(50..60), "55");
+        assert_eq!((q.len(), pos), (10, Some(5)));
+        assert_eq!(q[0].id, "50");
     }
 }

@@ -1,5 +1,8 @@
 //! Shared page helpers.
 use super::*;
+use crate::i18n::{t, tf};
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarMode};
+use std::rc::Rc;
 
 pub enum Load<T> {
     Loading,
@@ -25,10 +28,9 @@ impl<T> Load<T> {
 /// Vertical scroll container used by every page, with a scrollbar that can be
 /// dragged (or clicked on its track) and keyboard scrolling (see [`scroll_page_key`]).
 pub fn page_scroll(id: &'static str, handle: &ScrollHandle) -> PageScroll {
-    ACTIVE_PAGE.with(|a| *a.borrow_mut() = Some((id, handle.clone())));
     PageScroll {
         id,
-        inner: div().id(id).size_full().overflow_y_scroll().track_scroll(handle),
+        inner: div().id("page-scroll-content").absolute().inset_0().overflow_y_scroll().track_scroll(handle),
         handle: handle.clone(),
     }
 }
@@ -49,45 +51,84 @@ impl ParentElement for PageScroll {
 }
 
 impl RenderOnce for PageScroll {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
-        // on hover rather than only while scrolling, so it can be found without a wheel
-        let mode = if crate::store::settings_snapshot().always_scrollbars { ScrollbarMode::Always } else { ScrollbarMode::Hover };
-        if gpui_kit::component::Theme::global(cx).scrollbar_mode != mode {
-            gpui_kit::component::Theme::set_scrollbar_mode(mode, cx);
-        }
-        div()
-            .relative()
-            .flex_1()
-            .size_full()
-            .min_h_0()
-            .min_w_0()
-            .child(self.inner)
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .child(
-                        Scrollbar::vertical(&self.handle)
-                            .id((ElementId::from(self.id), "sb"))
-                            .mode(mode)
-                            .viewport_from_layout(),
-                    ),
-            )
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        scroll_viewport(self.id, &self.handle, self.inner, window, cx)
     }
 }
 
+/// Give virtual lists and regular scroll areas the same keyboard, glide and scrollbar behavior.
+pub fn scroll_viewport<H: PageScrollHandle + Clone + 'static, E: IntoElement>(
+    id: &'static str,
+    handle: &H,
+    content: E,
+    window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement + use<H, E> {
+    let shared: Rc<dyn PageScrollHandle> = Rc::new(handle.clone());
+    ACTIVE_PAGE.with(|a| *a.borrow_mut() = Some((id, shared.clone())));
+    let mode = if crate::store::settings_snapshot().always_scrollbars { ScrollbarMode::Always } else { ScrollbarMode::Hover };
+    div()
+        .id(id)
+        .relative()
+        .size_full()
+        .overflow_hidden()
+        // Update the scroll position before the content reads it for this frame.
+        .child(smooth_scroll(id, shared))
+        .child(content)
+        // Keep the scrollbar overlay in viewport coordinates as the content moves underneath it.
+        .when(!window.is_inspector_picking(cx), |page| {
+            page.child(div().absolute().inset_0().child(
+                Scrollbar::vertical(handle).id("page-scrollbar").mode(mode).viewport_from_layout(),
+            ))
+        })
+}
+
+pub trait PageScrollHandle: ScrollbarHandle {
+    fn jump_to_end(&self) -> bool {
+        false
+    }
+}
+
+impl PageScrollHandle for ScrollHandle {}
+
+impl PageScrollHandle for ListState {
+    fn jump_to_end(&self) -> bool {
+        self.scroll_to_end();
+        true
+    }
+}
+
+type ActivePage = (&'static str, Rc<dyn PageScrollHandle>);
+
 thread_local! {
     /// the page scroll area drawn last, which is the page on screen
-    static ACTIVE_PAGE: std::cell::RefCell<Option<(&'static str, ScrollHandle)>> = const { std::cell::RefCell::new(None) };
+    static ACTIVE_PAGE: std::cell::RefCell<Option<ActivePage>> = const { std::cell::RefCell::new(None) };
+    static GLIDES: std::cell::RefCell<std::collections::HashMap<&'static str, Glide>> = Default::default();
+}
+
+struct Glide {
+    /// where the page is drawn now / where it's heading (offset.y, <= 0)
+    shown: f32,
+    target: f32,
+    last: std::time::Instant,
+    /// the last wheel event came from a touchpad
+    precise: bool,
+    /// a mouse wheel moved the page since the last frame (anything else that
+    /// moves it, like dragging the scrollbar, is followed exactly)
+    wheel: Option<std::time::Instant>,
 }
 
 /// Scrolls the page on screen for PageUp/PageDown, Home/End, the arrow keys and
 /// Space / Shift+Space. Returns false when the key isn't a scrolling key.
 pub fn scroll_page_key(key: &str, shift: bool, window: &mut Window) -> bool {
-    let Some((_id, handle)) = ACTIVE_PAGE.with(|a| a.borrow().clone()) else { return false };
-    let view: f32 = handle.bounds().size.height.into();
-    let max: f32 = handle.max_offset().y.into();
+    let Some((id, handle)) = ACTIVE_PAGE.with(|a| a.borrow().clone()) else { return false };
+    if key == "end" && handle.jump_to_end() {
+        GLIDES.with(|g| g.borrow_mut().remove(id));
+        window.refresh();
+        return true;
+    }
+    let view: f32 = handle.viewport_bounds().size.height.into();
+    let max: f32 = scroll_limit(handle.as_ref()).into();
     let page = (view * 0.85).max(100.0);
     let delta = match (key, shift) {
         ("pagedown", _) | ("space", false) => -page,
@@ -99,10 +140,86 @@ pub fn scroll_page_key(key: &str, shift: bool, window: &mut Window) -> bool {
         _ => return false,
     };
     let now: f32 = handle.offset().y.into();
-    let target = (now + delta).clamp(-max.max(0.0), 0.0);
-    handle.set_offset(point(handle.offset().x, px(target)));
+    GLIDES.with(|g| {
+        let mut g = g.borrow_mut();
+        let st = g.entry(id).or_insert(Glide { shown: now, target: now, last: std::time::Instant::now(), precise: false, wheel: None });
+        // from where it's already heading, so repeated presses add up
+        let in_flight = (st.target - now).abs() > 0.5 && !st.precise;
+        let from = if in_flight { st.target } else { now };
+        if !in_flight {
+            st.last = std::time::Instant::now();
+        }
+        st.precise = false;
+        st.target = (from + delta).clamp(-max.max(0.0), 0.0);
+        st.shown = now;
+    });
     window.refresh();
     true
+}
+
+/// Mouse-wheel scrolling that glides instead of jumping a fixed step per notch.
+/// gpui moves the page by the whole step; this notices the jump, keeps it as the
+/// target and eases the visible position there over the next frames. Touchpad
+/// scrolling is already smooth and passes through untouched.
+fn smooth_scroll(id: &'static str, handle: Rc<dyn PageScrollHandle>) -> impl IntoElement {
+    /// how quickly it settles: ~63% of the way every TAU
+    const TAU: f32 = 0.045;
+    /// mouse-wheel notches move a bit further than gpui's line step
+    const WHEEL_BOOST: f32 = 1.4;
+    let wheel_handle = handle.clone();
+    canvas(
+        move |_, window, _| {
+            let now = std::time::Instant::now();
+            let actual: f32 = handle.offset().y.into();
+            let max: f32 = scroll_limit(handle.as_ref()).into();
+            GLIDES.with(|g| {
+                let mut g = g.borrow_mut();
+                let st = g.entry(id).or_insert(Glide { shown: actual, target: actual, last: now, precise: false, wheel: None });
+                let wheel = st.wheel.take();
+                let moved = actual - st.shown;
+                if moved.abs() > 0.01 {
+                    // something moved the page since the last frame
+                    let Some(wheel_at) = wheel.filter(|_| !st.precise && moved.abs() <= 3000.0) else {
+                        // touchpad, the scrollbar, or a jump (new page, scroll to top): follow it exactly
+                        *st = Glide { shown: actual, target: actual, last: now, precise: st.precise, wheel: None };
+                        return;
+                    };
+                    if (st.target - st.shown).abs() < 0.5 {
+                        st.last = wheel_at;
+                    }
+                    st.target += moved * WHEEL_BOOST;
+                }
+                st.target = st.target.clamp(-max.max(0.0), 0.0);
+                let gap = st.target - st.shown;
+                if gap.abs() < 0.5 {
+                    st.shown = st.target;
+                } else {
+                    let dt = now.duration_since(st.last).as_secs_f32().min(0.05);
+                    st.shown += gap * (1.0 - (-dt / TAU).exp());
+                    window.request_animation_frame();
+                }
+                st.last = now;
+                if (st.shown - actual).abs() > 0.01 {
+                    handle.set_offset(point(handle.offset().x, px(st.shown)));
+                }
+            });
+        },
+        move |_, _, window, _| {
+            let wheel_handle = wheel_handle.clone();
+            window.on_mouse_event(move |ev: &ScrollEvent, phase, _, _| {
+                if phase == DispatchPhase::Capture && wheel_handle.viewport_bounds().contains(&ev.position) {
+                    GLIDES.with(|g| {
+                        if let Some(st) = g.borrow_mut().get_mut(id) {
+                            st.precise = ev.delta.precise();
+                            st.wheel.get_or_insert_with(std::time::Instant::now);
+                        }
+                    });
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_0()
 }
 
 /// A scroll area inside a page (queue, chat, chapters). gpui hands a wheel event
@@ -114,10 +231,14 @@ pub fn nested_scroll(id: impl Into<ElementId>, list: impl IntoElement) -> Statef
 
 /// True when the scroll position is within `margin` of the bottom, or when the
 /// page is laid out but its content doesn't fill it (nothing to scroll yet).
-pub fn near_bottom(handle: &ScrollHandle, margin: f32) -> bool {
+fn scroll_limit(handle: &dyn ScrollbarHandle) -> Pixels {
+    (handle.content_size().height - handle.viewport_bounds().size.height).max(px(0.))
+}
+
+pub fn near_bottom(handle: &impl ScrollbarHandle, margin: f32) -> bool {
     let off: f32 = (-handle.offset().y).into();
-    let max: f32 = handle.max_offset().y.into();
-    let laid_out = handle.bounds().size.height > px(0.);
+    let max: f32 = scroll_limit(handle).into();
+    let laid_out = handle.viewport_bounds().size.height > px(0.);
     (max > 0.0 && off >= max - margin) || (laid_out && max <= 0.0)
 }
 
@@ -133,7 +254,7 @@ pub fn section_title(text: impl Into<SharedString>, cx: &App) -> Div {
 
 /// Sets up a "load more" trigger: call from render; spawns `f` when near the bottom.
 pub fn maybe_load_more<T: 'static>(
-    handle: &ScrollHandle,
+    handle: &impl ScrollbarHandle,
     loading: &mut bool,
     has_more: bool,
     cx: &mut Context<T>,
@@ -355,11 +476,11 @@ pub fn rich_text_with(id: impl Into<ElementId>, text: String, emojis: &[(String,
         .child(view)
         .on_mouse_down(MouseButton::Right, move |ev: &MouseDownEvent, window, cx| {
             cx.stop_propagation();
-            let t = copy_text.clone();
-            let mut items = vec![crate::ui::app::MenuItem::new("copy", "Copy all text", move |_, cx| crate::ui::copy_to_clipboard(t.clone(), cx))];
+            let text = copy_text.clone();
+            let mut items = vec![crate::ui::app::MenuItem::new("copy", t("Copy all text"), move |_, cx| crate::ui::copy_to_clipboard(text.clone(), cx))];
             for u in urls.iter().take(3) {
                 let u2 = u.clone();
-                let label = if u.chars().count() > 40 { format!("Copy link {}…", u.chars().take(40).collect::<String>()) } else { format!("Copy link {u}") };
+                let label = if u.chars().count() > 40 { tf!("Copy link {0}…", u.chars().take(40).collect::<String>()) } else { tf!("Copy link {0}", u) };
                 items.push(crate::ui::app::MenuItem::new("link", label, move |_, cx| crate::ui::copy_to_clipboard(u2.clone(), cx)));
             }
             crate::ui::app::open_menu(ev.position, items, window, cx);
@@ -414,7 +535,7 @@ pub fn comment_body(id: impl Into<SharedString>, c: &crate::api::types::Comment,
                     .text_color(p.text2)
                     .cursor_pointer()
                     .hover(move |s| s.text_color(p.text))
-                    .child(if open { "Show less" } else { "Read more" })
+                    .child(if open { t("Show less") } else { t("Read more") })
                     .on_click(move |_, window, cx| {
                         cx.stop_propagation();
                         OPEN_COMMENTS.with(|o| {

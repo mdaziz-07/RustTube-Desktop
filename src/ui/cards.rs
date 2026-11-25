@@ -1,8 +1,9 @@
 //! Video / channel / playlist cards in YouTube desktop style.
 use super::*;
+use crate::i18n::{t, tf};
 use crate::api::types::*;
 use crate::store;
-use crate::ui::app::{MenuItem, Route, navigate, open_menu};
+use crate::ui::app::{MenuItem, Route, navigate, open_in_new_tab, open_menu};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -78,22 +79,22 @@ pub fn meta_line(v: &VideoItem) -> String {
     }
     if v.is_live {
         if parts.is_empty() {
-            parts.push("LIVE".into());
+            parts.push(t("LIVE").into());
         }
     } else if let Some(p) = &v.published_text {
         parts.push(p.clone());
     } else if let Some(ts) = v.published_ts {
         parts.push(crate::api::json::relative_from_ts(ts));
     }
-    parts.join(" • ")
+    parts.join(", ")
 }
 
 fn badge(v: &VideoItem, cx: &App) -> Option<AnyElement> {
     let _ = cx;
     let (text, bg): (String, Hsla) = if v.is_live {
-        ("LIVE".into(), rgb(0xcc0000).into())
+        (t("LIVE").into(), rgb(0xcc0000).into())
     } else if v.is_upcoming {
-        ("UPCOMING".into(), hsla(0., 0., 0., 0.8))
+        (t("UPCOMING").into(), hsla(0., 0., 0., 0.8))
     } else if v.is_short && v.duration_text.is_none() {
         ("SHORTS".into(), hsla(0., 0., 0., 0.8))
     } else {
@@ -139,7 +140,10 @@ fn thumbnail_with_bounds(
         .rounded(r)
         .overflow_hidden()
         .bg(p.surface)
-        .child(img(SharedString::from(url)).size_full().rounded(r).object_fit(ObjectFit::Cover))
+        // the card's ratio: otherwise the image's own (4:3 for letterboxed
+        // sddefault/hqdefault) wins over the size, the image ends up taller than
+        // the card and shows top-aligned with the bottom cut off
+        .child(img(SharedString::from(url)).size_full().rounded(r).aspect_ratio(w / h).object_fit(ObjectFit::Cover))
         .child(crate::player::preview::slot_marker(&v.id, slot_bounds, cx))
         .children(badge(v, cx))
         .when_some(progress.filter(|p| *p > 0.01), |d, pr| {
@@ -160,58 +164,58 @@ pub fn video_menu_items(v: &VideoItem) -> Vec<MenuItem> {
     let mut items = Vec::new();
     {
         let route = if v.is_short { Route::Shorts(Some(v.id.clone())) } else { Route::Watch { id: v.id.clone(), playlist: None, start: None } };
-        items.push(MenuItem::new("app-window", "Open in new tab", move |window, cx| {
+        items.push(MenuItem::new("app-window", t("Open in new tab"), move |window, cx| {
             crate::ui::app::open_in_new_tab(route.clone(), false, window, cx)
         }));
     }
     let v1 = v.clone();
-    items.push(MenuItem::new("list-plus", "Add to queue", move |_, cx| {
+    items.push(MenuItem::new("list-plus", t("Add to queue"), move |_, cx| {
         crate::player::controller::enqueue(v1.clone(), cx);
-        toast(cx, "Added to queue");
+        toast(cx, t("Added to queue"));
     }));
     let v2 = v.clone();
-    items.push(MenuItem::new("clock", "Save to Watch later", move |_, cx| {
+    items.push(MenuItem::new("clock", t("Save to Watch later"), move |_, cx| {
         if let Some(wl) = store::playlists().into_iter().find(|p| p.protected && p.name == "Watch later") {
             store::playlist_add(wl.id, &v2);
-            toast(cx, "Saved to Watch later");
+            toast(cx, t("Saved to Watch later"));
         }
     }));
     let v3 = v.clone();
-    items.push(MenuItem::new("bookmark", "Save to playlist…", move |window, cx| {
+    items.push(MenuItem::new("bookmark", t("Save to playlist…"), move |window, cx| {
         crate::ui::app::open_save_dialog(v3.clone(), window, cx);
     }));
     let v4 = v.clone();
-    items.push(MenuItem::new("download", "Download", move |_, cx| {
+    items.push(MenuItem::new("download", t("Download"), move |_, cx| {
         crate::downloads::start(v4.clone(), None, cx);
     }));
     let v5 = v.clone();
-    items.push(MenuItem::new("external-link", "Open in external player", move |_, cx| {
+    items.push(MenuItem::new("external-link", t("Open in external player"), move |_, cx| {
         crate::downloads::open_external(&v5.id, cx);
     }));
     let id = v.id.clone();
-    items.push(MenuItem::new("link", "Copy link", move |_, cx| {
+    items.push(MenuItem::new("link", t("Copy link"), move |_, cx| {
         copy_to_clipboard(format!("https://www.youtube.com/watch?v={id}"), cx);
     }));
     let id2 = v.id.clone();
-    items.push(MenuItem::new("globe", "Open on YouTube", move |_, _| {
+    items.push(MenuItem::new("globe", t("Open on YouTube"), move |_, _| {
         let _ = open::that(format!("https://www.youtube.com/watch?v={id2}"));
     }));
     if let Some(cid) = v.channel_id.clone() {
         let name = v.channel_name.clone();
-        items.push(MenuItem::new("ban", "Don't recommend channel", move |_, cx| {
+        items.push(MenuItem::new("ban", t("Don't recommend channel"), move |_, cx| {
             let (cid, name) = (cid.clone(), name.clone());
             store::update_settings(|s| {
                 if !s.blocked_channels.iter().any(|(i, _)| *i == cid) {
                     s.blocked_channels.push((cid, name));
                 }
             });
-            toast(cx, "Channel blocked. Manage in Settings → Content filters");
+            toast(cx, t("Channel blocked. Manage in Settings → Content filters"));
             cx.refresh_windows();
         }));
     }
     if is_watched_in_history(&v.id) {
         let id3 = v.id.clone();
-        items.push(MenuItem::new("eye-off", "Remove from history", move |_, cx| {
+        items.push(MenuItem::new("eye-off", t("Remove from history"), move |_, cx| {
             store::history_remove(&id3);
             cx.default_global::<Watched>().0.remove(&id3);
             cx.refresh_windows();
@@ -249,17 +253,111 @@ fn watch_route(v: &VideoItem) -> Route {
     Route::Watch { id: v.id.clone(), playlist: None, start: None }
 }
 
+fn middle_click_tab(route: Route) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+    move |event, window, cx| {
+        if let ClickEvent::Mouse(click) = event {
+            if click.down.button == MouseButton::Middle && click.up.button == MouseButton::Middle {
+                cx.stop_propagation();
+                open_in_new_tab(route.clone(), false, window, cx);
+            }
+        }
+    }
+}
+
 // ───────────────────────── grid card (home / subscriptions / channel) ─────────────────────────
 
 /// Starts resolving a video's streams when the pointer rests on its thumbnail,
 /// so playback begins almost immediately on click.
-fn prefetch_hover(id: &str, slot_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+thread_local! {
+    static HOVER_FADES: std::cell::RefCell<std::collections::HashMap<String, (f32, std::time::Instant, bool)>> = Default::default();
+}
+
+fn set_card_hover(key: &str, hovered: bool, window: &mut Window) {
+    let now = std::time::Instant::now();
+    HOVER_FADES.with(|f| {
+        let mut map = f.borrow_mut();
+        if map.len() > 250 {
+            map.retain(|_, (a, _, act)| *act || *a > 0.005);
+        }
+        let e = map.entry(key.to_string()).or_insert((0.0, now, hovered));
+        e.1 = now;
+        e.2 = hovered;
+    });
+    window.refresh();
+}
+
+fn hover_bg_plate(key: String, thumb_url: String, inset: Pixels, radius: Pixels, cx: &App) -> Div {
+    let p = pal(cx);
+    let fallback = hsla(0., 0., if p.dark { 0.72 } else { 0.45 }, if p.dark { 0.08 } else { 0.12 });
+    let dark = p.dark;
+    div()
+        .absolute()
+        .inset(inset)
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let now = std::time::Instant::now();
+                    let (alpha, animating) = HOVER_FADES.with(|f| {
+                        let mut map = f.borrow_mut();
+                        let Some((alpha, last, active)) = map.get_mut(&key) else {
+                            return (0.0f32, false);
+                        };
+                        let target = if *active { 1.0 } else { 0.0 };
+                        let dt = now.duration_since(*last).as_secs_f32().min(0.05);
+                        *last = now;
+                        let gap = target - *alpha;
+                        if gap.abs() <= 0.005 {
+                            *alpha = target;
+                            (*alpha, false)
+                        } else {
+                            *alpha += gap * (1.0 - (-dt / 0.08).exp());
+                            (*alpha, true)
+                        }
+                    });
+                    if animating {
+                        window.request_animation_frame();
+                    }
+                    if alpha > 0.005 {
+                        let mut color = crate::ui::image_cache::thumb_hover_bg(&thumb_url, dark).unwrap_or(fallback);
+                        color.a *= alpha;
+                        let mut quad = fill(bounds, color);
+                        quad.corner_radii = Corners::all(radius);
+                        window.paint_quad(quad);
+                    }
+                },
+            )
+            .size_full(),
+        )
+}
+
+fn prefetch_hover(
+    hover_key: String,
+    id: &str,
+    slot_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
     let id = id.to_string();
-    move |hovered, _, cx| {
+    move |hovered, window, cx| {
+        set_card_hover(&hover_key, *hovered, window);
         if *hovered {
             crate::api::streams::prefetch_on_hover(&id);
         }
         crate::player::preview::hover(&id, *hovered, slot_bounds.get(), cx);
+    }
+}
+
+fn glimpse_hover(
+    hover_key: String,
+    id: &str,
+    slot_bounds: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+    let id = id.to_string();
+    move |hovered, window, cx| {
+        set_card_hover(&hover_key, *hovered, window);
+        if *hovered {
+            crate::api::streams::prefetch_on_hover(&id);
+        }
+        crate::player::preview::hover_glimpse(&id, *hovered, slot_bounds.get(), cx);
     }
 }
 
@@ -275,20 +373,24 @@ pub fn video_card(v: &VideoItem, width: Pixels, show_channel: bool, cx: &mut App
     let meta = meta_line(v);
     let show_avatar = show_channel && !store::settings_snapshot().hide_channel_avatars;
     let slot_bounds = std::rc::Rc::new(std::cell::Cell::new(None));
+    let hover_key = format!("vc-{}", v.id);
     div()
-        .id(SharedString::from(format!("vc-{}", v.id)))
-        .on_hover(prefetch_hover(&v.id, slot_bounds.clone()))
+        .id(SharedString::from(hover_key.clone()))
+        .relative()
+        .on_hover(prefetch_hover(hover_key.clone(), &v.id, slot_bounds.clone()))
         .flex()
         .flex_col()
         .w(width)
         .gap_3()
         .cursor_pointer()
         .group("card")
+        .on_aux_click(middle_click_tab(route.clone()))
         .on_click(move |_, window, cx| {
             if !crate::player::preview::consumed_click(cx) {
                 navigate(route.clone(), window, cx);
             }
         })
+        .child(hover_bg_plate(hover_key, thumb.clone(), px(-8.), px(16.), cx))
         .child(thumbnail_with_bounds(v, thumb, width, h, px(12.), Some(slot_bounds), cx))
         .child(
             div()
@@ -352,23 +454,26 @@ pub fn video_card(v: &VideoItem, width: Pixels, show_channel: bool, cx: &mut App
 pub fn shorts_card(v: &VideoItem, width: Pixels, cx: &mut App) -> AnyElement {
     let p = pal(cx);
     let (title, thumb) = branded(v, cx);
-    let id = v.id.clone();
+    let route = if store::settings_snapshot().shorts_in_player {
+        watch_route(v)
+    } else {
+        Route::Shorts(Some(v.id.clone()))
+    };
     let h = width * (16. / 9.);
+    let hover_key = format!("sc-{}", v.id);
+    let hk2 = hover_key.clone();
     div()
-        .id(SharedString::from(format!("sc-{}", v.id)))
+        .id(SharedString::from(hover_key.clone()))
+        .relative()
+        .on_hover(move |hovered, window, _| set_card_hover(&hk2, *hovered, window))
         .flex()
         .flex_col()
         .w(width)
         .gap_2()
         .cursor_pointer()
-        .on_click(move |_, window, cx| {
-            let route = if store::settings_snapshot().shorts_in_player {
-                Route::Watch { id: id.clone(), playlist: None, start: None }
-            } else {
-                Route::Shorts(Some(id.clone()))
-            };
-            navigate(route, window, cx)
-        })
+        .on_aux_click(middle_click_tab(route.clone()))
+        .on_click(move |_, window, cx| navigate(route.clone(), window, cx))
+        .child(hover_bg_plate(hover_key, thumb.clone(), px(-8.), px(16.), cx))
         .child(thumbnail(v, thumb, width, h, px(12.), cx))
         .child(
             div()
@@ -397,18 +502,22 @@ pub fn video_row(v: &VideoItem, thumb_w: Pixels, cx: &mut App) -> AnyElement {
     let channel_route = v.channel_id.clone().map(Route::Channel);
     let meta = meta_line(v);
     let slot_bounds = std::rc::Rc::new(std::cell::Cell::new(None));
+    let hover_key = format!("vr-{}", v.id);
     div()
-        .id(SharedString::from(format!("vr-{}", v.id)))
-        .on_hover(prefetch_hover(&v.id, slot_bounds.clone()))
+        .id(SharedString::from(hover_key.clone()))
+        .relative()
+        .on_hover(prefetch_hover(hover_key.clone(), &v.id, slot_bounds.clone()))
         .flex()
         .gap_4()
         .w_full()
         .cursor_pointer()
+        .on_aux_click(middle_click_tab(route.clone()))
         .on_click(move |_, window, cx| {
             if !crate::player::preview::consumed_click(cx) {
                 navigate(route.clone(), window, cx);
             }
         })
+        .child(hover_bg_plate(hover_key, thumb.clone(), px(-8.), px(16.), cx))
         .child(thumbnail_with_bounds(v, thumb, thumb_w, thumb_w * (9. / 16.), px(12.), Some(slot_bounds), cx))
         .child(
             div()
@@ -462,9 +571,11 @@ pub fn compact_row(v: &VideoItem, active: bool, on_click: Option<Arc<dyn Fn(&mut
     let thumb_w = px(store::settings_snapshot().related_thumb_width);
     let thumb_h = thumb_w * (9. / 16.);
     let slot_bounds = std::rc::Rc::new(std::cell::Cell::new(None));
+    let hover_key = format!("cr-{}", v.id);
     div()
-        .id(SharedString::from(format!("cr-{}", v.id)))
-        .on_hover(prefetch_hover(&v.id, slot_bounds.clone()))
+        .id(SharedString::from(hover_key.clone()))
+        .relative()
+        .on_hover(glimpse_hover(hover_key.clone(), &v.id, slot_bounds.clone()))
         .flex()
         .gap_2()
         .w_full()
@@ -472,7 +583,7 @@ pub fn compact_row(v: &VideoItem, active: bool, on_click: Option<Arc<dyn Fn(&mut
         .rounded_lg()
         .cursor_pointer()
         .when(active, |d| d.bg(p.hover))
-        .hover(move |s| s.bg(p.surface))
+        .on_aux_click(middle_click_tab(route.clone()))
         .on_click(move |_, window, cx| {
             if crate::player::preview::consumed_click(cx) {
                 return;
@@ -482,6 +593,7 @@ pub fn compact_row(v: &VideoItem, active: bool, on_click: Option<Arc<dyn Fn(&mut
                 None => navigate(route.clone(), window, cx),
             }
         })
+        .child(hover_bg_plate(hover_key, thumb.clone(), px(0.), px(8.), cx))
         .child(thumbnail_with_bounds(v, thumb, thumb_w, thumb_h, px(8.), Some(slot_bounds), cx))
         .child(
             div()
@@ -545,7 +657,7 @@ pub fn sync_subscription(channel_id: String, on: bool, cx: &mut App) {
     cx.spawn(async move |cx| {
         let res = blocking(move || crate::api::auth::subscribe(&channel_id, on)).await;
         if res.is_err() {
-            let _ = cx.update(|cx| toast(cx, "Couldn't update the subscription on your YouTube account"));
+            let _ = cx.update(|cx| toast(cx, t("Couldn't update the subscription on your YouTube account")));
         }
     })
     .detach();
@@ -566,18 +678,18 @@ pub fn subscribe_button(id: SharedString, c: &ChannelItem, subscribed: bool, cx:
         .cursor_pointer()
         .text_sm()
         .font_weight(FontWeight::MEDIUM)
-        .when(subscribed, |d| d.bg(p.chip).text_color(p.text).hover(move |s| s.bg(p.hover)).child(icon("bell").size_4()).child("Subscribed"))
-        .when(!subscribed, |d| d.bg(p.chip_active_bg).text_color(p.chip_active_fg).child("Subscribe"))
+        .when(subscribed, |d| d.bg(p.chip).text_color(p.text).hover(move |s| s.bg(p.hover)).child(icon("bell").size_4()).child(t("Subscribed")))
+        .when(!subscribed, |d| d.bg(p.chip_active_bg).text_color(p.chip_active_fg).child(t("Subscribe")))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
             let on = !store::is_subscribed(&c.id);
             if on {
                 store::subscribe(&c.id, &c.name, c.avatar.as_deref());
-                toast(cx, format!("Subscribed to {}", c.name));
+                toast(cx, tf!("Subscribed to {0}", c.name));
             } else {
                 store::unsubscribe(&c.id);
-                toast(cx, format!("Unsubscribed from {}", c.name));
+                toast(cx, tf!("Unsubscribed from {0}", c.name));
             }
             sync_subscription(c.id.clone(), on, cx);
             cx.refresh_windows();
@@ -626,7 +738,7 @@ pub fn playlist_card(pl: &PlaylistItem, width: Pixels, cx: &mut App) -> AnyEleme
                 .gap_1()
                 .child(div().text_base().font_weight(FontWeight::SEMIBOLD).text_color(p.text).line_clamp(2).child(pl.title.clone()))
                 .when_some(pl.channel_name.clone(), |d, c| d.child(div().text_sm().text_color(p.text2).truncate().child(c)))
-                .child(div().text_sm().text_color(p.text2).child("View full playlist")),
+                .child(div().text_sm().text_color(p.text2).child(t("View full playlist"))),
         )
         .into_any_element()
 }
@@ -695,7 +807,7 @@ pub fn playlist_row(pl: &PlaylistItem, cx: &mut App) -> AnyElement {
                 .flex_1()
                 .child(div().text_lg().text_color(p.text).line_clamp(2).child(pl.title.clone()))
                 .when_some(pl.channel_name.clone(), |d, c| d.child(div().text_xs().text_color(p.text2).child(c)))
-                .child(div().text_xs().text_color(p.text2).font_weight(FontWeight::MEDIUM).child("View full playlist")),
+                .child(div().text_xs().text_color(p.text2).font_weight(FontWeight::MEDIUM).child(t("View full playlist"))),
         )
         .into_any_element()
 }
@@ -711,17 +823,20 @@ pub fn grid_item(item: &Item, width: Pixels, show_channel: bool, cx: &mut App) -
 
 /// Grid layout: computes columns from available width.
 pub fn grid(items: Vec<AnyElement>, _avail: Pixels) -> Div {
-    let gy = match store::settings_snapshot().density.as_str() {
+    div().flex().flex_wrap().gap_x_4().gap_y(grid_row_gap()).w_full().children(items)
+}
+
+pub fn grid_row_gap() -> Pixels {
+    px(match store::settings_snapshot().density.as_str() {
         "compact" => 20.,
         "comfortable" => 48.,
         _ => 36.,
-    };
-    div().flex().flex_wrap().gap_x_4().gap_y(px(gy)).w_full().children(items)
+    })
 }
 
-pub fn grid_columns(avail: Pixels, min_card: f32) -> (usize, Pixels) {
+pub fn grid_columns(avail: Pixels, min_card: f32, gap: Pixels) -> (usize, Pixels) {
     let cfg = store::settings_snapshot().grid_columns as usize;
-    let gap = 16.0;
+    let gap: f32 = gap.into();
     let w: f32 = avail.into();
     let cols = if cfg > 0 { cfg } else { (((w + gap) / (min_card + gap)).floor() as usize).clamp(1, 6) };
     let card = (w - gap * (cols as f32 - 1.0)) / cols as f32;

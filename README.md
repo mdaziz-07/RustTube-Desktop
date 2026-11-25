@@ -42,7 +42,7 @@ goes through libmpv, so it starts fast and scrolls smoothly even with big feeds.
 - Home, Shorts, Subscriptions, Explore categories, channels (including their courses and shows), playlists and search, with search suggestions and your recent searches
 - A personal Home without an account: "For you" recommends videos related to what you've watched and searched in the app, mixed with new uploads from your subscriptions. Signed in, Home is your own YouTube Home feed
 - A *Recently uploaded* chip on Home, like youtube.com's: videos from your Home feed and subscriptions uploaded in the last two weeks, newest first
-- Tabs: Ctrl+click anything (or *Open in new tab* in a video's menu) to open it in the background, and switch with Ctrl+Tab, Ctrl+1…9 or a click. Ctrl+T opens a new tab, Ctrl+W or a middle click closes one
+- Ctrl+click a link or middle-click a video to open it in a background tab. A video's menu also has *Open in new tab*. Switch with Ctrl+Tab, Ctrl+1…9 or a click. Ctrl+T opens a new tab. Ctrl+W or a middle click on the tab closes it.
 - Videos made for kids (YouTube Kids) play and download like any other video
 - Old video annotations are back: notes, speech bubbles and clickable links from YouTube's annotation archive, drawn over the video where they used to be (turn them off in *Settings → Player* or from the player's gear menu)
 - Arabic, Hebrew and other right-to-left text is shown in the right order
@@ -51,11 +51,11 @@ goes through libmpv, so it starts fast and scrolls smoothly even with big feeds.
 - A chapters panel beside the player, like youtube.com: click the chapter name in the player bar (or *View all* under the description) to list every chapter with its thumbnail, follow the one playing, and jump to any of them
 - Timestamps in descriptions and comments seek the video and bring the player back into view
 - Resumes where you left off, remembers your last quality, autoplays the next video or loops, and plays whole playlists as a queue
-- A miniplayer while you browse that you can drag anywhere and resize (it remembers where you put it), a picture-in-picture window, theater mode and fullscreen
-- Keeps playing when minimized, or pauses and resumes when you come back
+- A miniplayer while you browse that you can drag anywhere and resize (it remembers where you put it), a picture-in-picture window, theater mode and fullscreen. Theater mode is saved between launches and can be set in *Settings → Player*.
+- Keeps playing when minimized, or pauses and resumes when you come back. On Windows, active video playback keeps the display awake.
 - Live streams with live chat (Top chat or every message), and chatting when signed in
 - Shorts in a vertical player that moves to the next one by itself, or open them in the regular player. Shorts comments open their replies as threads too
-- Hold Space or press and hold on the video to play at 2x
+- Hold Space or press and hold the main video to play at 2x
 - Hover previews: rest the pointer on a thumbnail and it plays inside it, muted, with a seek bar to skip around
 - Most replayed graph with "jump ahead", ambient glow around the player (on or off from the player's gear menu), force original audio instead of auto-dubbing
 - A screenshot button in the player bar
@@ -100,12 +100,13 @@ goes through libmpv, so it starts fast and scrolls smoothly even with big feeds.
 **Network**
 - A proxy setting (HTTP or SOCKS) that covers browsing, playback, thumbnails, downloads and sign-in
 - On Linux, a choice of Wayland or X11, with an automatic switch to X11 if a Wayland window never shows up (ChromeOS)
-- IPv4-only mode, and a choice of playback client (visionOS, Android VR or yt-dlp) if videos ever stop loading
+- IPv4-only mode applies to new requests as soon as you change it. You can also choose a playback client (visionOS, Android VR or yt-dlp).
 
 **Looks the way you like**
 - Dark, light or follow Windows
 - Seven accent colours used across the app, and the app icon changes colour to match, on the taskbar and on your desktop shortcuts too
 - Interface scaling, density, thumbnail corner style, grid columns, start page, language and region
+- English, Azerbaijani, French, German, Japanese, Kazakh, Russian, Turkish, Ukrainian, Simplified Chinese and Traditional Chinese in *Settings → General → App language*. YouTube has a separate language setting.
 - Smooth page, dialog and menu transitions, and mouse-wheel scrolling that glides instead of jumping
 - Scrollbars you can drag (shown on hover, or always), and pages scroll from the keyboard too: Page Up/Down, Home/End, the arrow keys and Space
 
@@ -171,21 +172,21 @@ Windows doesn't have one.
 **Debian, Ubuntu, Mint**: install the `.deb`. This also installs libmpv:
 
 ```sh
-sudo apt install ./streamtube_0.7.2-alpha_amd64.deb
+sudo apt install ./streamtube_0.7.3-alpha_amd64.deb
 ```
 
 **Fedora, openSUSE**: install the `.rpm`:
 
 ```sh
-sudo dnf install ./streamtube-0.7.2-alpha.x86_64.rpm
+sudo dnf install ./streamtube-0.7.3-alpha.x86_64.rpm
 ```
 
 **Any Linux (x86_64), nothing to install**: download the AppImage, make it executable
 and run it. libmpv is inside, so video plays without installing anything else:
 
 ```sh
-chmod +x StreamTube-0.7.2-alpha-x86_64.AppImage
-./StreamTube-0.7.2-alpha-x86_64.AppImage
+chmod +x StreamTube-0.7.3-alpha-x86_64.AppImage
+./StreamTube-0.7.3-alpha-x86_64.AppImage
 ```
 
 **Other Linux (x86_64), installed for your user**: unpack `StreamTube-<version>-linux-x86_64.tar.gz` and run
@@ -220,7 +221,7 @@ and each file has a signed build provenance attestation that ties it to the work
 run that built it. With the [GitHub CLI](https://cli.github.com):
 
 ```sh
-gh attestation verify StreamTube-0.7.2-alpha-setup.exe --repo Avaneesh-Inamdar/Stream-Tube-Desktop
+gh attestation verify StreamTube-0.7.3-alpha-setup.exe --repo Avaneesh-Inamdar/Stream-Tube-Desktop
 ```
 
 Releases are immutable once published, so their files can't be swapped afterwards.
@@ -252,7 +253,7 @@ else, copy `libmpv-2.dll` next to it.
 To build the installer, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and run:
 
 ```powershell
-ISCC.exe /DAppVersion=0.7.2-alpha installer\streamtube.iss
+ISCC.exe /DAppVersion=0.7.3-alpha installer\streamtube.iss
 ```
 
 It lands in `dist\`. On Linux, install the packages listed in

@@ -1,4 +1,5 @@
 use crate::store;
+use crate::i18n::{t as translate, tf};
 use crate::ui::app::{Route, confirm, navigate, prompt_text};
 use crate::ui::cards::*;
 use crate::ui::widgets::*;
@@ -29,7 +30,7 @@ fn only_videos(items: Vec<crate::api::types::Item>) -> impl Iterator<Item = crat
 
 impl HistoryPage {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Search history"));
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder(translate("Search history")));
         cx.observe(&filter, |_, _, cx| cx.notify()).detach();
         let signed_in = crate::api::auth::signed_in();
         let mut s = Self {
@@ -134,12 +135,12 @@ impl HistoryPage {
             let id2 = id.clone();
             let res = blocking(move || crate::api::auth::remove_from_history(&id2)).await;
             let _ = this.update(cx, |t, cx| match res {
-                Ok(()) => toast(cx, "Removed from watch history"),
+                Ok(()) => toast(cx, translate("Removed from watch history")),
                 Err(e) => {
                     if let Some(Load::Ready(list)) = &mut t.yt {
                         list.insert(pos.min(list.len()), removed);
                     }
-                    toast(cx, format!("Couldn't remove it from YouTube: {}", crate::ui::friendly_error(&e.to_string())));
+                    toast(cx, tf!("Couldn't remove it from YouTube: {0}", crate::ui::friendly_error(&e.to_string())));
                     cx.notify();
                 }
             });
@@ -153,7 +154,7 @@ impl HistoryPage {
         let ql = q.to_lowercase();
         let items: Vec<String> = store::search_history("", 500).into_iter().filter(|s| ql.is_empty() || s.to_lowercase().contains(&ql)).collect();
         if items.is_empty() {
-            return list.child(empty_state("search", if q.is_empty() { "No searches yet" } else { "No matches" }, "Searches made in this app show here", cx));
+            return list.child(empty_state("search", if q.is_empty() { "No searches yet" } else { "No matches" }, translate("Searches made in this app show here"), cx));
         }
         for (i, item) in items.into_iter().enumerate() {
             let (a, b) = (item.clone(), item.clone());
@@ -184,11 +185,12 @@ impl HistoryPage {
 
 fn loading_row(cx: &App) -> Div {
     let p = pal(cx);
-    div().py_6().flex().justify_center().text_color(p.text2).child("Loading…")
+    div().py_6().flex().justify_center().text_color(p.text2).child(translate("Loading…"))
 }
 
 impl Render for HistoryPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        localize_placeholder(&self.filter, "Search history", window, cx);
         let p = pal(cx);
         let s = store::settings_snapshot();
         let q = self.filter.read(cx).value().to_string();
@@ -211,7 +213,7 @@ impl Render for HistoryPage {
             vec![(HistTab::Device, "Watched"), (HistTab::Searches, "Searches")]
         };
         for (t, label) in tab_defs {
-            tabs = tabs.child(chip(SharedString::from(format!("ht-{label}")), label, self.tab == t, cx).on_click(cx.listener(move |this, _, _, cx| {
+            tabs = tabs.child(chip(SharedString::from(format!("ht-{label}")), translate(label), self.tab == t, cx).on_click(cx.listener(move |this, _, _, cx| {
                 this.tab = t;
                 cx.notify();
             })));
@@ -274,7 +276,7 @@ impl Render for HistoryPage {
             .child(
                 pill("h-search", Some("search-x"), "Clear search history", cx).on_click(cx.listener(|_, _, _, cx| {
                     store::search_history_clear();
-                    toast(cx, "Search history cleared");
+                    toast(cx, translate("Search history cleared"));
                     cx.notify();
                 })),
             );
@@ -285,7 +287,7 @@ impl Render for HistoryPage {
                     .flex()
                     .flex_col()
                     .gap_4()
-                    .child(section_title("History", cx).text_3xl())
+                    .child(section_title(translate("History"), cx).text_3xl())
                     .child(tabs)
                     .child(div().flex().gap_8().child(list).child(side)),
             ),
@@ -321,10 +323,10 @@ impl LibraryPage {
 }
 
 impl Render for LibraryPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = pal(cx);
         let width = content_width(cx);
-        let (_, w) = grid_columns(width, 260.0);
+        let (_, w) = grid_columns(width, 260.0, window.rem_size());
         let pls = store::playlists();
         let mut cards: Vec<AnyElement> = pls
             .iter()
@@ -338,16 +340,16 @@ impl Render for LibraryPage {
                     .w(w)
                     .cursor_pointer()
                     .on_click(move |_, window, cx| navigate(Route::LocalPlaylist(id), window, cx))
-                    .child(playlist_thumb(pl.thumbnail.clone(), Some(format!("{} videos", pl.count)), w, w * (9. / 16.), cx))
+                    .child(playlist_thumb(pl.thumbnail.clone(), Some(tf!("{0} videos", pl.count)), w, w * (9. / 16.), cx))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_2()
                             .when(pl.protected, |d| d.child(icon(if pl.name == "Watch later" { "clock" } else { "heart" }).size_4().text_color(p.text2)))
-                            .child(div().text_base().font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(pl.name.clone())),
+                            .child(div().text_base().font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(if pl.protected { translate(&pl.name).to_string() } else { pl.name.clone() })),
                     )
-                    .child(div().text_xs().text_color(p.text2).child("Local • Private"))
+                    .child(div().text_xs().text_color(p.text2).child(translate("Local, private")))
                     .into_any_element()
             })
             .collect();
@@ -368,7 +370,7 @@ impl Render for LibraryPage {
                 .cursor_pointer()
                 .hover(move |s| s.bg(p.surface))
                 .child(icon("plus").size_8().text_color(p.text2))
-                .child(div().text_sm().text_color(p.text2).child("New playlist"))
+                .child(div().text_sm().text_color(p.text2).child(translate("New playlist")))
                 .on_click(|_, window, cx| {
                     prompt_text("New playlist", "Playlist name", window, cx, |name, _, cx| {
                         store::playlist_create(&name);
@@ -379,7 +381,7 @@ impl Render for LibraryPage {
         );
         let saved = store::saved_playlists();
         let history: Vec<_> = store::history_list("", 12).into_iter().map(|h| h.video).collect();
-        let (_, hw) = grid_columns(width, 220.0);
+        let (_, hw) = grid_columns(width, 220.0, window.rem_size());
         page_scroll("lib-scroll", &self.scroll).child(
             div()
                 .flex()
@@ -399,7 +401,7 @@ impl Render for LibraryPage {
                                     .flex()
                                     .items_center()
                                     .justify_between()
-                                    .child(section_title("History", cx))
+                                    .child(section_title(translate("History"), cx))
                                     .child(pill("lib-hist", None, "View all", cx).on_click(|_, window, cx| navigate(Route::History, window, cx))),
                             )
                             .child(div().flex().gap_4().overflow_hidden().children(history.iter().take(6).map(|v| video_card(v, hw, true, cx)))),
@@ -407,20 +409,20 @@ impl Render for LibraryPage {
                 })
                 .when_some(self.yt.as_ref().map(|l| match l {
                     Load::Loading => spinner(cx).into_any_element(),
-                    Load::Error(e) => div().text_sm().text_color(p.text2).child(format!("Could not load your YouTube playlists: {e}")).into_any_element(),
-                    Load::Ready(l) if l.is_empty() => div().text_sm().text_color(p.text2).child("No playlists on your account yet").into_any_element(),
+                    Load::Error(e) => div().text_sm().text_color(p.text2).child(tf!("Could not load your YouTube playlists: {0}", e)).into_any_element(),
+                    Load::Ready(l) if l.is_empty() => div().text_sm().text_color(p.text2).child(translate("No playlists on your account yet")).into_any_element(),
                     Load::Ready(l) => grid(l.iter().map(|pl| playlist_card(pl, w, cx)).collect(), width).into_any_element(),
                 }), |d, body| {
-                    d.child(div().flex().flex_col().gap_4().child(section_title("Your YouTube playlists", cx)).child(body))
+                    d.child(div().flex().flex_col().gap_4().child(section_title(translate("Your YouTube playlists"), cx)).child(body))
                 })
-                .child(div().flex().flex_col().gap_4().child(section_title("On this computer", cx)).child(grid(cards, width)))
+                .child(div().flex().flex_col().gap_4().child(section_title(translate("On this computer"), cx)).child(grid(cards, width)))
                 .when(!saved.is_empty(), |d| {
                     d.child(
                         div()
                             .flex()
                             .flex_col()
                             .gap_4()
-                            .child(section_title("Saved playlists", cx))
+                            .child(section_title(translate("Saved playlists"), cx))
                             .child(grid(saved.iter().map(|pl| playlist_card(pl, w, cx)).collect(), width)),
                     )
                 }),

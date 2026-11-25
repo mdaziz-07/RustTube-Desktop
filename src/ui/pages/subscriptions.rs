@@ -1,4 +1,5 @@
 use crate::api::types::*;
+use crate::i18n::{t, tf};
 use crate::store;
 use crate::ui::app::{MenuItem, Route, confirm, navigate, open_menu, prompt_text};
 use crate::ui::cards::*;
@@ -87,8 +88,11 @@ impl FeedPage {
             let res = blocking(move || {
                 // signed in: the account's own subscriptions feed, one request instead of one per channel
                 if account {
-                    if let Ok(v) = crate::api::auth::subscriptions_videos(4) {
+                    if let Ok(mut v) = crate::api::auth::subscriptions_videos(4) {
                         if !v.is_empty() {
+                            // it isn't in date order, and the day headings repeat
+                            // ("Yesterday", "This week", "Yesterday") unless it is
+                            crate::feed::sort_feed(&mut v);
                             return (v, 0);
                         }
                     }
@@ -104,7 +108,7 @@ impl FeedPage {
                 this.videos = res.0;
                 this.last_updated = Some(crate::api::json::now());
                 if res.1 > 0 {
-                    toast(cx, format!("{} channels could not be refreshed", res.1));
+                    toast(cx, tf!("{0} channels could not be refreshed", res.1));
                 }
                 cx.notify();
             });
@@ -115,14 +119,14 @@ impl FeedPage {
 }
 
 impl Render for FeedPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = pal(cx);
         let s = store::settings_snapshot();
         if near_bottom(&self.scroll, 800.0) && self.shown < self.videos.len() {
             self.shown += 60;
         }
         let width = content_width(cx);
-        let (_, card_w) = grid_columns(width, 300.0);
+        let (_, card_w) = grid_columns(width, 300.0, window.rem_size());
         if store::subscriptions().is_empty() && !crate::api::auth::signed_in() {
             return page_scroll("feed-scroll", &self.scroll)
                 .child(
@@ -142,7 +146,7 @@ impl Render for FeedPage {
                 .into_any_element();
         }
         let profiles = store::profiles();
-        let mut bar = div().flex().items_center().gap_2().flex_wrap().child(chip("pf-all", "All channels", self.profile.is_none(), cx).on_click(cx.listener(|t, _, _, cx| {
+        let mut bar = div().flex().items_center().gap_2().flex_wrap().child(chip("pf-all", t("All channels"), self.profile.is_none(), cx).on_click(cx.listener(|t, _, _, cx| {
             t.profile = None;
             t.load_cached();
             cx.notify();
@@ -160,7 +164,7 @@ impl Render for FeedPage {
             if k == Kind::Shorts && s.hide_shorts {
                 continue;
             }
-            bar = bar.child(chip(SharedString::from(format!("k-{l}")), l, self.kind == k, cx).on_click(cx.listener(move |t, _, _, cx| {
+            bar = bar.child(chip(SharedString::from(format!("k-{l}")), t(l), self.kind == k, cx).on_click(cx.listener(move |t, _, _, cx| {
                 t.kind = k;
                 cx.notify();
             })));
@@ -178,8 +182,8 @@ impl Render for FeedPage {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .when_some(self.last_updated.filter(|_| !self.refreshing), |d, t| d.child(div().text_xs().text_color(p.text2).child(format!("Updated {}", crate::api::json::relative_from_ts(t)))))
-                    .when(self.refreshing, |d| d.child(div().text_xs().text_color(p.text2).child(if total == 0 { "Refreshing…".to_string() } else { format!("Refreshing {done}/{total}…") })))
+                    .when_some(self.last_updated.filter(|_| !self.refreshing), |d, t| d.child(div().text_xs().text_color(p.text2).child(tf!("Updated {0}", crate::api::json::relative_from_ts(t)))))
+                    .when(self.refreshing, |d| d.child(div().text_xs().text_color(p.text2).child(if total == 0 { t("Refreshing…").to_string() } else { tf!("Refreshing {0}/{1}…", done, total) })))
                     .child(
                         pill("hide-watched", Some(if s.hide_watched_in_feed { "eye-off" } else { "eye" }), if s.hide_watched_in_feed { "Watched hidden" } else { "Hide watched" }, cx).on_click(|_, _, cx| {
                             store::update_settings(|s| s.hide_watched_in_feed ^= true);
@@ -208,7 +212,7 @@ impl Render for FeedPage {
         } else if vids.is_empty() {
             empty_state("inbox", "No videos", "", cx).into_any_element()
         } else if kind == Kind::Shorts {
-            let (_, w) = grid_columns(width, 200.0);
+            let (_, w) = grid_columns(width, 200.0, window.rem_size());
             grid(vids.iter().take(self.shown).map(|v| shorts_card(v, w, cx)).collect(), width).into_any_element()
         } else {
             // group by day buckets like YouTube
@@ -234,7 +238,7 @@ impl Render for FeedPage {
                 let b = bucket(v.published_ts);
                 if cur != Some(b) {
                     if let Some(c) = cur {
-                        col = col.child(div().flex().flex_col().gap_4().child(section_title(c, cx)).child(grid(std::mem::take(&mut group), width)));
+                        col = col.child(div().flex().flex_col().gap_4().child(section_title(t(c), cx)).child(grid(std::mem::take(&mut group), width)));
                     }
                     cur = Some(b);
                 }
@@ -242,7 +246,7 @@ impl Render for FeedPage {
                 group.push(video_card(&v2, card_w, true, cx));
             }
             if let Some(c) = cur {
-                col = col.child(div().flex().flex_col().gap_4().child(section_title(c, cx)).child(grid(group, width)));
+                col = col.child(div().flex().flex_col().gap_4().child(section_title(t(c), cx)).child(grid(group, width)));
             }
             if self.shown < total_vids {
                 col = col.child(spinner(cx));
@@ -263,20 +267,21 @@ pub struct ChannelsPage {
 
 impl ChannelsPage {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter channels"));
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder(t("Filter channels")));
         cx.observe(&filter, |_, _, cx| cx.notify()).detach();
         Self { filter, scroll: ScrollHandle::new(), profile: None }
     }
 }
 
 impl Render for ChannelsPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        localize_placeholder(&self.filter, "Filter channels", window, cx);
         let p = pal(cx);
         let q = self.filter.read(cx).value().to_lowercase();
         let subs: Vec<store::Subscription> = store::subscriptions().into_iter().filter(|s| q.is_empty() || s.name.to_lowercase().contains(&q)).collect();
         let profiles = store::profiles();
         let cur_profile = self.profile.and_then(|id| profiles.iter().find(|p| p.id == id).cloned());
-        let mut pbar = div().flex().items_center().gap_2().flex_wrap().child(chip("mp-none", "All", self.profile.is_none(), cx).on_click(cx.listener(|t, _, _, cx| {
+        let mut pbar = div().flex().items_center().gap_2().flex_wrap().child(chip("mp-none", t("All"), self.profile.is_none(), cx).on_click(cx.listener(|t, _, _, cx| {
             t.profile = None;
             cx.notify();
         })));
@@ -355,17 +360,17 @@ impl Render for ChannelsPage {
                             for pr in store::profiles() {
                                 let member = pr.channels.contains(&cid2);
                                 let c = cid2.clone();
-                                items.push(MenuItem::new(if member { "square-check" } else { "square" }, format!("Profile: {}", pr.name), move |_, cx| {
+                                items.push(MenuItem::new(if member { "square-check" } else { "square" }, tf!("Profile: {0}", pr.name), move |_, cx| {
                                     store::set_profile_channel(pr.id, &c, !member);
                                     cx.refresh_windows();
                                 }));
                             }
                             let c = cid2.clone();
                             let n = name.clone();
-                            items.push(MenuItem::new("user-minus", "Unsubscribe", move |_, cx| {
+                            items.push(MenuItem::new("user-minus", t("Unsubscribe"), move |_, cx| {
                                 store::unsubscribe(&c);
                                 crate::ui::cards::sync_subscription(c.clone(), false, cx);
-                                toast(cx, format!("Unsubscribed from {n}"));
+                                toast(cx, tf!("Unsubscribed from {0}", n));
                                 cx.refresh_windows();
                             }));
                             open_menu(ev.position(), items, window, cx);
@@ -385,7 +390,7 @@ impl Render for ChannelsPage {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .child(section_title(format!("Subscriptions ({})", store::subscriptions().len()), cx))
+                            .child(section_title(tf!("Subscriptions ({0})", store::subscriptions().len()), cx))
                             .child(div().w(px(260.)).px_3().py_1().rounded_full().border_1().border_color(p.border).child(Input::new(&self.filter).appearance(false).cleanable(true))),
                     )
                     .child(pbar)

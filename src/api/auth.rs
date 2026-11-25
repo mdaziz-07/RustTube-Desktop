@@ -592,6 +592,30 @@ pub fn playlist(playlist_id: &str) -> Result<PlaylistPage> {
     Ok(PlaylistPage { info, description: None, videos, continuation: page.continuation })
 }
 
+/// Adds a video to one of the signed-in account's playlists.
+pub fn add_to_playlist(playlist_id: &str, video_id: &str) -> Result<()> {
+    let r = tv_call(
+        "browse/edit_playlist",
+        json!({ "playlistId": playlist_id, "actions": [{ "action": "ACTION_ADD_VIDEO", "addedVideoId": video_id }] }),
+    )?;
+    if let Some(s) = r.get("status").and_then(Value::as_str).filter(|s| *s != "STATUS_SUCCEEDED") {
+        return Err(anyhow!("edit_playlist: {s}"));
+    }
+    Ok(())
+}
+
+/// Removes several videos from one of the signed-in account's playlists.
+pub fn remove_many_from_playlist(playlist_id: &str, video_ids: &[String]) -> Result<()> {
+    for chunk in video_ids.chunks(50) {
+        let actions: Vec<Value> = chunk.iter().map(|id| json!({ "action": "ACTION_REMOVE_VIDEO_BY_VIDEO_ID", "removedVideoId": id })).collect();
+        let r = tv_call("browse/edit_playlist", json!({ "playlistId": playlist_id, "actions": actions }))?;
+        if let Some(s) = r.get("status").and_then(Value::as_str).filter(|s| *s != "STATUS_SUCCEEDED") {
+            return Err(anyhow!("edit_playlist: {s}"));
+        }
+    }
+    Ok(())
+}
+
 /// Posts a message to a live stream's chat as the signed-in account.
 pub fn send_live_chat(channel_id: &str, video_id: &str, message: &str) -> Result<()> {
     // protobuf { 1: { 5: { 1: channel, 2: video } }, 2: 1, 3: 4 }

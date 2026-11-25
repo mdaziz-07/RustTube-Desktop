@@ -226,6 +226,27 @@ const OBSERVED: &[(&str, c_int)] = &[
     ("core-idle", MPV_FORMAT_FLAG),
 ];
 
+#[cfg(windows)]
+fn set_playback_awake(playing: bool, video: bool) {
+    const ES_CONTINUOUS: u32 = 0x8000_0000;
+    const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+    const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetThreadExecutionState(flags: u32) -> u32;
+    }
+
+    let mut flags = ES_CONTINUOUS;
+    if playing {
+        flags |= ES_SYSTEM_REQUIRED;
+        if video {
+            flags |= ES_DISPLAY_REQUIRED;
+        }
+    }
+    unsafe { SetThreadExecutionState(flags) };
+}
+
 struct Handle(*mut mpv_handle);
 unsafe impl Send for Handle {}
 unsafe impl Sync for Handle {}
@@ -322,6 +343,8 @@ impl Mpv {
             let ev_cb = events.clone();
             let t1 = std::thread::Builder::new().name("mpv-events".into()).spawn(move || {
                 let (_, f) = lib().unwrap();
+                #[cfg(windows)]
+                let (mut playing, mut has_video) = (false, false);
                 loop {
                     let e = (f.wait_event)(ev_handle.0, -1.0);
                     if e.is_null() {
@@ -347,17 +370,33 @@ impl Mpv {
                         EV_PROPERTY_CHANGE => {
                             let p = &*(e.data as *const mpv_event_property);
                             let idx = e.reply_userdata as usize;
-                            if idx < OBSERVED.len() && !p.data.is_null() {
+                            if idx < OBSERVED.len() {
                                 let name = OBSERVED[idx].0;
-                                let val = match p.format {
-                                    MPV_FORMAT_DOUBLE => Some(PropValue::Double(*(p.data as *const f64))),
-                                    MPV_FORMAT_FLAG => Some(PropValue::Flag(*(p.data as *const c_int) != 0)),
-                                    MPV_FORMAT_STRING => {
-                                        let s = *(p.data as *const *const c_char);
-                                        (!s.is_null()).then(|| PropValue::Str(CStr::from_ptr(s).to_string_lossy().into_owned()))
+                                let val = if p.data.is_null() {
+                                    None
+                                } else {
+                                    match p.format {
+                                        MPV_FORMAT_DOUBLE => Some(PropValue::Double(*(p.data as *const f64))),
+                                        MPV_FORMAT_FLAG => Some(PropValue::Flag(*(p.data as *const c_int) != 0)),
+                                        MPV_FORMAT_STRING => {
+                                            let s = *(p.data as *const *const c_char);
+                                            (!s.is_null()).then(|| PropValue::Str(CStr::from_ptr(s).to_string_lossy().into_owned()))
+                                        }
+                                        _ => None,
                                     }
-                                    _ => None,
                                 };
+                                #[cfg(windows)]
+                                match name {
+                                    "core-idle" => {
+                                        playing = matches!(val.as_ref(), Some(PropValue::Flag(false)));
+                                        set_playback_awake(playing, has_video);
+                                    }
+                                    "dwidth" => {
+                                        has_video = matches!(val.as_ref(), Some(PropValue::Double(width)) if *width > 0.0);
+                                        set_playback_awake(playing, has_video);
+                                    }
+                                    _ => {}
+                                }
                                 if let Some(v) = val {
                                     ev_cb(MpvEvent::Prop(name, v));
                                 }
@@ -366,6 +405,8 @@ impl Mpv {
                         _ => {}
                     }
                 }
+                #[cfg(windows)]
+                set_playback_awake(false, false);
             })?;
 
             // render thread
@@ -429,10 +470,18 @@ impl Mpv {
                     // (the buffer is 64-byte aligned, so reading it as u32 is fine)
                     let src = std::slice::from_raw_parts(buf.as_ptr() as *const u32, bytes / 4);
                     let opaque = u32::from_ne_bytes([0, 0, 0, 0xFF]);
-                    let mut data = vec![0u8; bytes];
-                    for (d, s) in data.chunks_exact_mut(4).zip(src) {
-                        d.copy_from_slice(&(s | opaque).to_ne_bytes());
+                    // a frame the UI never picked up gives its buffer back; otherwise a
+                    // fresh one, written once (not zeroed first: ~8 MB a frame at 1080p)
+                    let mut data = r.frame.lock().take().map(|f| f.data).filter(|d| d.capacity() >= bytes).unwrap_or_default();
+                    data.clear();
+                    data.reserve_exact(bytes);
+                    for (d, s) in data.spare_capacity_mut()[..bytes].chunks_exact_mut(4).zip(src) {
+                        for (o, b) in d.iter_mut().zip((s | opaque).to_ne_bytes()) {
+                            o.write(b);
+                        }
                     }
+                    // SAFETY: the loop above wrote all `bytes` bytes (bytes is w*h*4, src has w*h pixels)
+                    data.set_len(bytes);
                     let serial = r.serial.fetch_add(1, Ordering::Relaxed) + 1;
                     *r.frame.lock() = Some(VideoFrame { width: w, height: h, data, serial });
                     frame_cb(MpvEvent::Frame);

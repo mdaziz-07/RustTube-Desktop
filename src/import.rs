@@ -17,11 +17,13 @@ pub struct ImportReport {
 
 impl std::fmt::Display for ImportReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Imported {} subscriptions, {} history entries, {} playlists ({} videos)",
-            self.subscriptions, self.history, self.playlists, self.playlist_videos
-        )
+        f.write_str(&crate::i18n::tf!(
+            "Imported {0} subscriptions, {1} history entries, {2} playlists ({3} videos)",
+            self.subscriptions,
+            self.history,
+            self.playlists,
+            self.playlist_videos
+        ))
     }
 }
 

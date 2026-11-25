@@ -1,4 +1,5 @@
 use crate::downloads::{Downloads, JobStatus};
+use crate::i18n::{t, tf};
 use crate::store;
 use crate::ui::app::{Route, navigate};
 use crate::ui::widgets::*;
@@ -25,11 +26,11 @@ impl Render for DownloadsPage {
             let id = j.id;
             let vid = j.video.id.clone();
             let (status, color): (String, Hsla) = match &j.status {
-                JobStatus::Queued => ("Queued".into(), p.text2),
-                JobStatus::Running => (if j.detail.is_empty() { "Starting…".into() } else { j.detail.clone() }, p.text2),
-                JobStatus::Done(path) => (format!("Saved to {path}"), rgb(0x2ba640).into()),
-                JobStatus::Failed(e) => (format!("Failed: {e}"), rgb(0xff4e45).into()),
-                JobStatus::Cancelled => ("Cancelled".into(), p.text3),
+                JobStatus::Queued => (t("Queued").into(), p.text2),
+                JobStatus::Running => (if j.detail.is_empty() { t("Starting…").into() } else { j.detail.clone() }, p.text2),
+                JobStatus::Done(path) => (tf!("Saved to {0}", path), rgb(0x2ba640).into()),
+                JobStatus::Failed(e) => (tf!("Failed: {0}", e), rgb(0xff4e45).into()),
+                JobStatus::Cancelled => (t("Cancelled").into(), p.text3),
             };
             let done_path = if let JobStatus::Done(path) = &j.status { Some(path.clone()) } else { None };
             let running = matches!(j.status, JobStatus::Running | JobStatus::Queued);
@@ -56,7 +57,7 @@ impl Render for DownloadsPage {
                             .min_w_0()
                             .gap_2()
                             .child(div().text_base().font_weight(FontWeight::SEMIBOLD).text_color(p.text).truncate().child(j.video.title.clone()))
-                            .child(div().text_xs().text_color(p.text2).child(format!("{} • format: {}", j.video.channel_name, j.format)))
+                            .child(div().text_xs().text_color(p.text2).child(tf!("{0}, format {1}", j.video.channel_name, j.format)))
                             .when(running, |d| {
                                 d.child(div().w_full().h(px(4.)).rounded_full().bg(p.hover).child(div().h_full().rounded_full().w(relative(j.progress.clamp(0.0, 1.0))).bg(p.accent)))
                             })
@@ -88,7 +89,7 @@ impl Render for DownloadsPage {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .child(section_title("Downloads", cx).text_3xl())
+                            .child(section_title(t("Downloads"), cx).text_3xl())
                             .child(
                                 div()
                                     .flex()
@@ -97,7 +98,7 @@ impl Render for DownloadsPage {
                                         d.child(pill("dl-clear", Some("list-x"), "Clear list", cx).on_click(|_, _, cx| crate::downloads::clear_history(cx)))
                                     })
                                     .child(pill("dl-change", Some("folder-cog"), "Change folder", cx).on_click(|_, _, cx| {
-                                        let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Save downloads here".into()) });
+                                        let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some(t("Save downloads here").into()) });
                                         cx.spawn(async move |cx| {
                                             if let Ok(Ok(Some(paths))) = rx.await {
                                                 if let Some(d) = paths.into_iter().next() {
@@ -117,10 +118,7 @@ impl Render for DownloadsPage {
                                     })),
                             ),
                     )
-                    .child(div().text_sm().text_color(p.text2).child(format!(
-                        "Saving to {dir}. Engine: {}",
-                        if ytdlp { "yt-dlp (all qualities, SponsorBlock chapters)" } else { "built-in (combined 360p/720p or audio only — install yt-dlp for more)" }
-                    )))
+                    .child(div().text_sm().text_color(p.text2).child(tf!("Saving to {0}. Engine {1}", dir, if ytdlp { t("yt-dlp (all qualities, SponsorBlock chapters)") } else { t("built-in (combined 360p/720p or audio only). Install yt-dlp for more") })))
                     .child(list),
             ),
         )

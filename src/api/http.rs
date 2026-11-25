@@ -1,27 +1,94 @@
 use anyhow::{Context, Result, anyhow};
+use parking_lot::Mutex;
 use serde_json::Value;
 use std::io::Read;
-use std::sync::OnceLock;
 use std::time::Duration;
+use ureq::config::{ConfigBuilder, IpFamily};
+use ureq::typestate::AgentScope;
 
 pub const BROWSER_UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
-fn agent() -> &'static ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| {
-        let mut b = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            .http_status_as_error(false)
-            .ip_family(crate::store::ip_family())
-            .user_agent(BROWSER_UA);
-        if let Some(p) = crate::store::proxy_setting() {
-            if let Ok(proxy) = ureq::Proxy::new(&p) {
-                b = b.proxy(Some(proxy));
+pub(crate) struct NetworkAgent(Mutex<Option<CachedAgent>>);
+
+struct CachedAgent {
+    ipv4_only: bool,
+    proxy: String,
+    agent: ureq::Agent,
+}
+
+impl NetworkAgent {
+    pub(crate) const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    pub(crate) fn get(
+        &self,
+        settings: &crate::store::Settings,
+        configure: impl FnOnce(ConfigBuilder<AgentScope>) -> ConfigBuilder<AgentScope>,
+    ) -> ureq::Agent {
+        let mut cached = self.0.lock();
+        if let Some(current) = cached.as_ref().filter(|current| {
+            current.ipv4_only == settings.ipv4_only && current.proxy == settings.proxy
+        }) {
+            return current.agent.clone();
+        }
+
+        let family = if settings.ipv4_only {
+            IpFamily::Ipv4Only
+        } else {
+            IpFamily::Any
+        };
+        let mut builder = configure(ureq::Agent::config_builder()).ip_family(family);
+        if !settings.proxy.trim().is_empty() {
+            if let Ok(proxy) = ureq::Proxy::new(&settings.proxy) {
+                builder = builder.proxy(Some(proxy));
             }
         }
-        b.build().into()
+        let agent = builder.build().new_agent();
+        *cached = Some(CachedAgent {
+            ipv4_only: settings.ipv4_only,
+            proxy: settings.proxy.clone(),
+            agent: agent.clone(),
+        });
+        agent
+    }
+}
+
+fn agent() -> ureq::Agent {
+    static AGENT: NetworkAgent = NetworkAgent::new();
+    AGENT.get(&crate::store::settings_snapshot(), |builder| {
+        builder
+            .timeout_global(Some(Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .user_agent(BROWSER_UA)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IpFamily, NetworkAgent};
+    use crate::store::Settings;
+
+    #[test]
+    fn changes_address_family_after_the_first_request() {
+        let cache = NetworkAgent::new();
+        let mut settings = Settings {
+            ipv4_only: true,
+            ..Settings::default()
+        };
+        let initial = cache.get(&settings, |builder| builder);
+        assert_eq!(initial.config().ip_family(), IpFamily::Ipv4Only);
+
+        settings.ipv4_only = false;
+        let updated = cache.get(&settings, |builder| builder);
+        assert_eq!(updated.config().ip_family(), IpFamily::Any);
+        assert_eq!(initial.config().ip_family(), IpFamily::Ipv4Only);
+
+        settings.ipv4_only = true;
+        let restored = cache.get(&settings, |builder| builder);
+        assert_eq!(restored.config().ip_family(), IpFamily::Ipv4Only);
+    }
 }
 
 pub fn get_bytes(url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>> {

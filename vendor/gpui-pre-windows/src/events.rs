@@ -575,7 +575,7 @@ impl WindowsWindowInner {
         };
 
         let wheel_distance =
-            (wparam.signed_hiword() as f32 / WHEEL_DELTA as f32) * wheel_scroll_amount as f32 * 2.4;
+            (wparam.signed_hiword() as f32 / WHEEL_DELTA as f32) * wheel_scroll_amount as f32;
         let mut cursor_point = POINT {
             x: lparam.signed_loword().into(),
             y: lparam.signed_hiword().into(),

@@ -8,7 +8,71 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::sync::Arc;
+use futures::channel::oneshot;
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+
+static THUMB_COLORS: std::sync::LazyLock<parking_lot::RwLock<HashMap<String, Rgba>>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
+
+/// Samples a balanced ambient RGB color from decoded RGBA8 image bytes and caches it for hover cards.
+fn record_thumb_color(url: &str, img: &image::RgbaImage) {
+    let (w, h) = img.dimensions();
+    if w < 8 || h < 8 {
+        return;
+    }
+    let data = img.as_raw();
+    let (mut r_sum, mut g_sum, mut b_sum, mut n) = (0f32, 0f32, 0f32, 0f32);
+    let (mut r_all, mut g_all, mut b_all, mut n_all) = (0f32, 0f32, 0f32, 0f32);
+    for gy in 0..8 {
+        for gx in 0..12 {
+            let x = w * (15 + gx * 70 / 11) / 100;
+            let y = h * (15 + gy * 70 / 7) / 100;
+            let idx = ((y.min(h - 1) * w + x.min(w - 1)) * 4) as usize;
+            let r = data[idx] as f32 / 255.0;
+            let g = data[idx + 1] as f32 / 255.0;
+            let b = data[idx + 2] as f32 / 255.0;
+            r_all += r;
+            g_all += g;
+            b_all += b;
+            n_all += 1.0;
+            let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            if lum > 0.08 && lum < 0.94 {
+                r_sum += r;
+                g_sum += g;
+                b_sum += b;
+                n += 1.0;
+            }
+        }
+    }
+    let color = if n >= 6.0 {
+        Rgba { r: r_sum / n, g: g_sum / n, b: b_sum / n, a: 1.0 }
+    } else if n_all > 0.0 {
+        Rgba { r: r_all / n_all, g: g_all / n_all, b: b_all / n_all, a: 1.0 }
+    } else {
+        return;
+    };
+    let mut map = THUMB_COLORS.write();
+    if map.len() > 2000 {
+        map.clear();
+    }
+    map.insert(url.to_string(), color);
+}
+
+/// Returns a smooth, light pastel card-hover tint matching a cached thumbnail's color.
+pub fn thumb_hover_bg(url: &str, dark: bool) -> Option<Hsla> {
+    let c = THUMB_COLORS.read().get(url).copied()?;
+    let mut h: Hsla = c.into();
+    if dark {
+        h.s = (h.s * 0.42).clamp(0.05, 0.32);
+        h.l = h.l.clamp(0.52, 0.72);
+        h.a = 0.14;
+    } else {
+        h.s = (h.s * 0.35).clamp(0.04, 0.28);
+        h.l = h.l.clamp(0.76, 0.90);
+        h.a = 0.28;
+    }
+    Some(h)
+}
 
 /// Web images are decoded no larger than this (Shorts covers come as 1080x1920,
 /// but are never drawn that big); every image stays decoded in memory.
@@ -26,14 +90,14 @@ enum Slot {
     /// app assets (logo SVGs and such): gpui's own loader
     Gpui(ImageCacheItem),
     /// web images: fetched and downscaled here
-    Web(Rc<RefCell<Own>>, Task<()>),
+    Web { state: Rc<RefCell<Own>>, _task: Task<()> },
 }
 
 impl Slot {
     fn get(&self) -> Option<LoadResult> {
         match self {
             Slot::Gpui(i) => i.get(),
-            Slot::Web(st, _) => match &*st.borrow() {
+            Slot::Web { state, .. } => match &*state.borrow() {
                 Own::Done(r) => Some(r.clone()),
                 Own::Loading(_) => None,
             },
@@ -43,7 +107,7 @@ impl Slot {
     fn use_image(&self, window: &Window) -> Option<LoadResult> {
         match self {
             Slot::Gpui(i) => i.use_image(window),
-            Slot::Web(st, _) => match &mut *st.borrow_mut() {
+            Slot::Web { state, .. } => match &mut *state.borrow_mut() {
                 Own::Done(r) => Some(r.clone()),
                 Own::Loading(views) => {
                     views.insert(window.current_view());
@@ -59,10 +123,9 @@ impl Slot {
             _ => return Slot::Gpui(ImageCacheItem::new(resource, cx)),
         };
         let state = Rc::new(RefCell::new(Own::Loading(HashSet::default())));
-        let work = cx.background_executor().spawn(async move { fetch_decode(&url) });
         let weak = Rc::downgrade(&state);
         let task = cx.spawn(async move |cx| {
-            let result = work.await.map_err(|e| ImageCacheError::Other(Arc::new(e)));
+            let result = fetch_in_background(url).await.map_err(|e| ImageCacheError::Other(Arc::new(e)));
             let Some(state) = weak.upgrade() else { return };
             let prev = std::mem::replace(&mut *state.borrow_mut(), Own::Done(result));
             if let Own::Loading(views) = prev {
@@ -73,8 +136,33 @@ impl Slot {
                 });
             }
         });
-        Slot::Web(state, task)
+        Slot::Web { state, _task: task }
     }
+}
+
+type ImageRequest = (String, oneshot::Sender<anyhow::Result<Arc<RenderImage>>>);
+
+/// Keep blocking HTTP off GPUI's workers and bound concurrent downloads.
+async fn fetch_in_background(url: String) -> anyhow::Result<Arc<RenderImage>> {
+    static QUEUE: OnceLock<mpsc::Sender<ImageRequest>> = OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<ImageRequest>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        for _ in 0..8 {
+            let receiver = receiver.clone();
+            std::thread::spawn(move || loop {
+                let job = receiver.lock().unwrap().recv();
+                let Ok((url, result)) = job else { break };
+                if !result.is_canceled() {
+                    let _ = result.send(fetch_decode(&url));
+                }
+            });
+        }
+        sender
+    });
+    let (send, receive) = oneshot::channel();
+    queue.send((url, send)).map_err(|_| anyhow::anyhow!("image workers unavailable"))?;
+    receive.await?
 }
 
 /// Downloads an image and decodes it (BGRA, like gpui), shrinking oversized ones.
@@ -92,6 +180,7 @@ fn fetch_decode(url: &str) -> anyhow::Result<Arc<RenderImage>> {
     } else {
         img.into_rgba8()
     };
+    record_thumb_color(url, &rgba);
     for px in rgba.chunks_exact_mut(4) {
         px.swap(0, 2);
     }

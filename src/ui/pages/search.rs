@@ -1,4 +1,5 @@
 use crate::api::innertube::{self, SearchFilter};
+use crate::i18n::t;
 use crate::api::types::*;
 use crate::store;
 use crate::ui::cards::*;
@@ -89,7 +90,7 @@ impl SearchPage {
             .flex_col()
             .flex_1()
             .min_w(px(150.))
-            .child(div().pb_3().mb_2().border_b_1().border_color(p.border).text_xs().font_weight(FontWeight::BOLD).text_color(p.text).child(title.to_uppercase()));
+            .child(div().pb_3().mb_2().border_b_1().border_color(p.border).text_xs().font_weight(FontWeight::BOLD).text_color(p.text).child(t(title).to_uppercase()));
         for (label, v) in options {
             let v = *v;
             let active = current == v && v != 0;
@@ -102,7 +103,7 @@ impl SearchPage {
                     .text_color(if active { p.text } else { p.text2 })
                     .when(active, |d| d.font_weight(FontWeight::BOLD))
                     .hover(move |s| s.text_color(p.text))
-                    .child(label.to_string())
+                    .child(t(label).to_string())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let cur = current;
                         set(&mut this.filter, if cur == v { 0 } else { v });
@@ -123,7 +124,7 @@ impl SearchPage {
             .text_color(if on { p.text } else { p.text2 })
             .when(on, |d| d.font_weight(FontWeight::BOLD))
             .hover(move |s| s.text_color(p.text))
-            .child(label.to_string())
+            .child(t(label).to_string())
             .on_click(cx.listener(move |this, _, _, cx| {
                 toggle(&mut this.filter);
                 this.load(cx);
@@ -148,7 +149,7 @@ impl Render for SearchPage {
             .child(
                 div().flex().gap_2().children(
                     [("All", 0u8), ("Videos", 1), ("Channels", 2), ("Playlists", 3), ("Movies", 4)].into_iter().map(|(l, k)| {
-                        chip(SharedString::from(format!("t-{l}")), l, f.kind == k, cx).on_click(cx.listener(move |this, _, _, cx| {
+                        chip(SharedString::from(format!("t-{l}")), t(l), f.kind == k, cx).on_click(cx.listener(move |this, _, _, cx| {
                             this.filter.kind = k;
                             this.load(cx);
                         }))
@@ -156,7 +157,7 @@ impl Render for SearchPage {
                 ),
             )
             .child(
-                pill("filters", Some("sliders-horizontal"), if f.is_default() { "Filters".to_string() } else { "Filters •".to_string() }, cx).on_click(
+                pill("filters", Some("sliders-horizontal"), if f.is_default() { "Filters" } else { "Filters (active)" }, cx).on_click(
                     cx.listener(|this, _, _, cx| {
                         this.show_filters ^= true;
                         cx.notify();
@@ -180,7 +181,7 @@ impl Render for SearchPage {
                         .flex_col()
                         .flex_1()
                         .min_w(px(150.))
-                        .child(div().pb_3().mb_2().border_b_1().border_color(p.border).text_xs().font_weight(FontWeight::BOLD).text_color(p.text).child("FEATURES"))
+                        .child(div().pb_3().mb_2().border_b_1().border_color(p.border).text_xs().font_weight(FontWeight::BOLD).text_color(p.text).child(t("FEATURES")))
                         .child(self.feature("Live", f.live, |f| f.live ^= true, cx))
                         .child(self.feature("4K", f.four_k, |f| f.four_k ^= true, cx))
                         .child(self.feature("HD", f.hd, |f| f.hd ^= true, cx))
@@ -220,7 +221,7 @@ impl Render for SearchPage {
                     );
                 }
                 if items.is_empty() {
-                    col = col.child(empty_state("search-x", "No results found", "Try different keywords or remove filters", cx));
+                    col = col.child(empty_state("search-x", "No results found", t("Try different keywords or remove filters"), cx));
                 }
                 if self.loading_more {
                     col = col.child(spinner(cx));

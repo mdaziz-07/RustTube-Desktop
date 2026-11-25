@@ -86,6 +86,35 @@ fn connect(cookies: BTreeMap<String, String>) -> Result<String> {
     Ok(name)
 }
 
+/// Writes the browser sign-in's youtube.com cookies as a Netscape cookies.txt for
+/// yt-dlp, in the private profile folder under a name of its own. The caller
+/// deletes it when yt-dlp is done. None when the browser sign-in isn't connected.
+pub fn write_cookies_file() -> Option<PathBuf> {
+    use std::sync::atomic::AtomicU64;
+    static N: AtomicU64 = AtomicU64::new(0);
+    let text = {
+        let s = session().lock();
+        let s = s.as_ref()?;
+        let mut t = String::from("# Netscape HTTP Cookie File\n");
+        for (k, v) in &s.cookies {
+            // domain, include subdomains, path, secure, expiry, name, value
+            t.push_str(&format!(".youtube.com\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n"));
+        }
+        t
+    };
+    let path = crate::store::data_dir().join(format!("yt-dlp-cookies-{}-{}.txt", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    use std::io::Write;
+    opts.open(&path).ok()?.write_all(text.as_bytes()).ok()?;
+    Some(path)
+}
+
 fn cookie_header() -> Option<String> {
     let s = session().lock();
     let s = s.as_ref()?;
@@ -224,41 +253,127 @@ pub fn browser_name() -> Option<String> {
     find_browser().map(|(n, _)| n)
 }
 
-fn local_agent() -> ureq::Agent {
-    ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(5))).http_status_as_error(false).build().into()
+/// The sign-in browser's DevTools connection. It runs over a pair of pipes that
+/// only this process holds (`--remote-debugging-pipe`), not a loopback port that
+/// any local process could connect to and read the fresh Google cookies from.
+struct Cdp {
+    to_browser: std::io::PipeWriter,
+    replies: mpsc::Receiver<Value>,
+    next_id: i64,
 }
 
-/// Asks the browser for its cookies over the DevTools protocol.
-fn cdp_cookies(port: u16) -> Result<Vec<Value>> {
-    let mut resp = local_agent().get(&format!("http://127.0.0.1:{port}/json/version")).call()?;
-    let v: Value = serde_json::from_str(&resp.body_mut().read_to_string()?)?;
-    let ws = v.get("webSocketDebuggerUrl").and_then(Value::as_str).ok_or_else(|| anyhow!("no debugger url"))?.to_string();
-    let stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    let (mut sock, _) = tungstenite::client(ws.as_str(), stream).map_err(|e| anyhow!("devtools: {e}"))?;
-    sock.send(tungstenite::Message::text(json!({ "id": 1, "method": "Storage.getCookies" }).to_string()))?;
-    loop {
-        let msg = sock.read()?;
-        if let tungstenite::Message::Text(t) = msg {
-            let v: Value = serde_json::from_str(t.as_str())?;
-            if v.get("id").and_then(Value::as_i64) == Some(1) {
-                let _ = sock.close(None);
-                return Ok(v.pointer("/result/cookies").and_then(Value::as_array).cloned().unwrap_or_default());
+impl Cdp {
+    /// Adds the pipe flags to the browser's command line. Call `spawn` on the
+    /// command, then `Cdp::started` with what this returns.
+    fn attach(cmd: &mut std::process::Command) -> Result<(Self, ChildEnds)> {
+        // the browser reads commands from the first pipe and writes replies to the second
+        let (browser_in, to_browser) = std::io::pipe()?;
+        let (from_browser, browser_out) = std::io::pipe()?;
+        cmd.arg("--remote-debugging-pipe");
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            let (r, w) = (browser_in.as_raw_fd(), browser_out.as_raw_fd());
+            unsafe extern "C" {
+                fn dup(fd: i32) -> i32;
+                fn dup2(from: i32, to: i32) -> i32;
+                fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+            }
+            const F_SETFD: i32 = 2;
+            // SAFETY: only async-signal-safe calls between fork and exec. Chromium
+            // expects its input on fd 3 and its output on fd 4.
+            unsafe {
+                cmd.pre_exec(move || {
+                    let (mut r, mut w) = (r, w);
+                    if w == 3 {
+                        w = dup(w);
+                    }
+                    if r == 4 {
+                        r = dup(r);
+                    }
+                    if r < 0 || w < 0 || dup2(r, 3) < 0 || dup2(w, 4) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // dup2 onto the same number keeps close-on-exec; clear it
+                    fcntl(3, F_SETFD, 0);
+                    fcntl(4, F_SETFD, 0);
+                    Ok(())
+                });
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+            }
+            const HANDLE_FLAG_INHERIT: u32 = 1;
+            let (r, w) = (browser_in.as_raw_handle(), browser_out.as_raw_handle());
+            // SAFETY: plain Win32 calls on handles this process owns. Only the
+            // browser's ends become inheritable; ours stay private.
+            unsafe {
+                if SetHandleInformation(r, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0
+                    || SetHandleInformation(w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
+            cmd.arg(format!("--remote-debugging-io-pipes={},{}", r as usize, w as usize));
+        }
+        let (tx, replies) = mpsc::channel();
+        std::thread::Builder::new().name("signin-devtools".into()).spawn(move || {
+            use std::io::BufRead;
+            let mut reader = std::io::BufReader::new(from_browser);
+            let mut buf = Vec::new();
+            // messages are JSON, each ended by a NUL byte
+            while reader.read_until(0, &mut buf).is_ok_and(|n| n > 0) {
+                if buf.last() == Some(&0) {
+                    buf.pop();
+                }
+                if let Ok(v) = serde_json::from_slice::<Value>(&buf) {
+                    if tx.send(v).is_err() {
+                        break;
+                    }
+                }
+                buf.clear();
+            }
+        })?;
+        Ok((Self { to_browser, replies, next_id: 0 }, ChildEnds(browser_in, browser_out)))
+    }
+
+    fn call(&mut self, method: &str) -> Result<Value> {
+        use std::io::Write;
+        self.next_id += 1;
+        let id = self.next_id;
+        let mut msg = json!({ "id": id, "method": method }).to_string().into_bytes();
+        msg.push(0);
+        self.to_browser.write_all(&msg)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = deadline.checked_duration_since(Instant::now()).ok_or_else(|| anyhow!("devtools: no reply"))?;
+            let v = self.replies.recv_timeout(left).map_err(|_| anyhow!("devtools: no reply"))?;
+            if v.get("id").and_then(Value::as_i64) == Some(id) {
+                return Ok(v);
             }
         }
     }
-}
 
-fn cdp_close(port: u16) {
-    let Ok(mut resp) = local_agent().get(&format!("http://127.0.0.1:{port}/json/version")).call() else { return };
-    let Ok(v) = serde_json::from_str::<Value>(&resp.body_mut().read_to_string().unwrap_or_default()) else { return };
-    let Some(ws) = v.get("webSocketDebuggerUrl").and_then(Value::as_str) else { return };
-    let Ok(stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else { return };
-    if let Ok((mut sock, _)) = tungstenite::client(ws, stream) {
-        let _ = sock.send(tungstenite::Message::text(json!({ "id": 2, "method": "Browser.close" }).to_string()));
-        let _ = sock.flush();
+    /// Asks the browser for its cookies.
+    fn cookies(&mut self) -> Result<Vec<Value>> {
+        let v = self.call("Storage.getCookies")?;
+        Ok(v.pointer("/result/cookies").and_then(Value::as_array).cloned().unwrap_or_default())
+    }
+
+    fn close_browser(&mut self) {
+        let _ = self.call("Browser.close");
     }
 }
+
+/// The browser's ends of the pipes. Dropped once it has started, so that only the
+/// browser holds them.
+struct ChildEnds(#[allow(dead_code)] std::io::PipeReader, #[allow(dead_code)] std::io::PipeWriter);
 
 fn youtube_cookies(list: &[Value]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
@@ -283,17 +398,16 @@ pub fn browser_sign_in(cancel: Arc<AtomicBool>) -> Result<String> {
     let profile = crate::store::data_dir().join("signin-browser");
     let _ = std::fs::remove_dir_all(&profile);
     std::fs::create_dir_all(&profile)?;
-    let port = std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port();
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg(format!("--user-data-dir={}", profile.display()))
-        .arg(format!("--remote-debugging-port={port}"))
-        .arg("--remote-allow-origins=http://127.0.0.1")
         .args(["--no-first-run", "--no-default-browser-check", "--disable-sync", "--new-window"])
         .arg(SIGN_IN_URL);
     if let Some(p) = crate::store::proxy_setting() {
         cmd.arg(format!("--proxy-server={p}"));
     }
+    let (mut cdp, browser_ends) = Cdp::attach(&mut cmd)?;
     let mut child = cmd.spawn().context("couldn't start the browser")?;
+    drop(browser_ends);
     let started = Instant::now();
     let result = loop {
         std::thread::sleep(Duration::from_millis(1500));
@@ -308,13 +422,13 @@ pub fn browser_sign_in(cancel: Arc<AtomicBool>) -> Result<String> {
         if started.elapsed() > Duration::from_secs(20 * 60) {
             break Err(anyhow!("Sign-in timed out."));
         }
-        let Ok(list) = cdp_cookies(port) else { continue };
+        let Ok(list) = cdp.cookies() else { continue };
         let cookies = youtube_cookies(&list);
         if has_login(&cookies) && cookies.contains_key("LOGIN_INFO") {
             break Ok(cookies);
         }
     };
-    cdp_close(port);
+    cdp.close_browser();
     for _ in 0..20 {
         if let Ok(Some(_)) = child.try_wait() {
             break;
@@ -595,5 +709,35 @@ mod host_tests {
         assert!(!is_youtube_https("https://youtube.com.evil.example/api"));
         assert!(!is_youtube_https("https://www.youtube.com@evil.example/api"));
         assert!(!is_youtube_https("https://evilyoutube.com/api"));
+    }
+}
+
+#[cfg(test)]
+mod devtools_pipe_tests {
+    /// Starts the real browser (headless) and talks to it over the private pipes.
+    #[test]
+    #[ignore = "needs Chrome, Edge, Brave or Chromium installed"]
+    fn talks_to_the_browser_over_pipes() {
+        let (_, exe) = super::find_browser().expect("a browser");
+        let profile = std::env::temp_dir().join(format!("st-cdp-test-{}", std::process::id()));
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg(format!("--user-data-dir={}", profile.display()))
+            .args(["--headless=new", "--no-first-run", "--no-default-browser-check", "about:blank"]);
+        let (mut cdp, ends) = super::Cdp::attach(&mut cmd).unwrap();
+        let mut child = cmd.spawn().unwrap();
+        drop(ends);
+        let mut ok = None;
+        for _ in 0..20 {
+            if let Ok(c) = cdp.cookies() {
+                ok = Some(c);
+                break;
+            }
+        }
+        cdp.close_browser();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&profile);
+        assert!(ok.is_some(), "no reply over the DevTools pipe");
     }
 }

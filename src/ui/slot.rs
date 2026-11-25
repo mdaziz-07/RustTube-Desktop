@@ -11,6 +11,14 @@ pub struct PlayerSlot(pub Rc<Cell<Option<Bounds<Pixels>>>>);
 
 impl Global for PlayerSlot {}
 
+/// Clears the recorded player slot bounds (call on navigation so the old page's
+/// slot size is never briefly drawn on the new page).
+pub fn clear_slot(cx: &App) {
+    if let Some(s) = cx.try_global::<PlayerSlot>() {
+        s.0.set(None);
+    }
+}
+
 /// Placeholder element that records where the player should be drawn.
 pub fn player_slot(cx: &App) -> impl IntoElement {
     let slot = cx.global::<PlayerSlot>().0.clone();
@@ -21,6 +29,7 @@ pub struct SlotFollower {
     slot: Rc<Cell<Option<Bounds<Pixels>>>>,
     child: Option<AnyElement>,
     laid_size: Option<Size<Pixels>>,
+    can_paint: bool,
 }
 
 impl SlotFollower {
@@ -32,7 +41,7 @@ impl SlotFollower {
     pub fn with_slot(slot: Rc<Cell<Option<Bounds<Pixels>>>>, view: AnyView) -> Self {
         let laid_size = slot.get().map(|b| b.size);
         let child = laid_size.map(|s| div().w(s.width).h(s.height).child(view).into_any_element());
-        Self { slot, child, laid_size }
+        Self { slot, child, laid_size, can_paint: false }
     }
 }
 
@@ -79,6 +88,7 @@ impl Element for SlotFollower {
         window: &mut Window,
         cx: &mut App,
     ) {
+        self.can_paint = false;
         let Some(slot) = self.slot.get() else {
             window.request_animation_frame();
             return;
@@ -86,10 +96,21 @@ impl Element for SlotFollower {
         if Some(slot.size) != self.laid_size {
             // slot changed size since layout: draw once more with the new size
             window.request_animation_frame();
+            // skip painting if orientation flipped (e.g. 16:9 Watch -> 9:16 Shorts)
+            if let Some(ls) = self.laid_size {
+                let old_land = f32::from(ls.width) > f32::from(ls.height);
+                let new_land = f32::from(slot.size.width) > f32::from(slot.size.height);
+                if old_land != new_land {
+                    return;
+                }
+            } else {
+                return;
+            }
         }
         if let Some(child) = self.child.as_mut() {
             let offset = slot.origin - bounds.origin;
             window.with_element_offset(offset, |window| child.prepaint(window, cx));
+            self.can_paint = true;
         }
     }
 
@@ -103,8 +124,10 @@ impl Element for SlotFollower {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if let Some(child) = self.child.as_mut() {
-            child.paint(window, cx);
+        if self.can_paint {
+            if let Some(child) = self.child.as_mut() {
+                child.paint(window, cx);
+            }
         }
     }
 }

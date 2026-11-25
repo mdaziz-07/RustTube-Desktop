@@ -1,6 +1,6 @@
 [package]
 name = "streamtube"
-version = "0.7.2-alpha"
+version = "0.7.4-alpha"
 edition = "2024"
 description = "A YouTube desktop client in Rust + GPUI with SponsorBlock, DeArrow, RYD, local subscriptions & more"
 license = "MIT"
@@ -25,7 +25,14 @@ rand = "0.9"
 open = "5"
 raw-window-handle = "0.6"
 sha1 = "0.11"
-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# already in the tree through GPUI; used to hide the pointer with the player controls
+objc2 = "0.6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# already in the tree through GPUI's Windows backend (same version and feature)
+windows = { version = "0.62", features = ["Win32_UI_WindowsAndMessaging"] }
 
 [profile.dev.package."*"]
 opt-level = 2

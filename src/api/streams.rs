@@ -48,7 +48,7 @@ pub fn prefetch_on_hover(video_id: &str) {
     let seq = SEQ.fetch_add(1, Ordering::SeqCst) + 1;
     let id = video_id.to_string();
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        std::thread::sleep(std::time::Duration::from_millis(50));
         if SEQ.load(Ordering::SeqCst) == seq {
             prefetch(&id);
         }
@@ -56,6 +56,11 @@ pub fn prefetch_on_hover(video_id: &str) {
 }
 
 fn resolve(video_id: &str) -> Result<StreamInfo> {
+    let res = resolve_anonymous(video_id);
+    with_sign_in_fallback(video_id, res)
+}
+
+fn resolve_anonymous(video_id: &str) -> Result<StreamInfo> {
     let mode = crate::store::settings_snapshot().stream_backend.clone();
     match mode.as_str() {
         "ytdlp" => ytdlp_streams(video_id),
@@ -303,10 +308,13 @@ fn hls_client(video_id: &str, c: HlsClient) -> Result<StreamInfo> {
     // adaptive URLs from this client need a PO token; only the HLS path is usable
     info.audio.clear();
     info.muxed.clear();
-    let (video, audio) = hls_variants(&hls).unwrap_or_default();
+    let (video, audio, hls_orig_lang) = hls_variants(&hls).unwrap_or_default();
     info.video = video;
     // audio renditions (dubbed tracks): only names, the proxy picks the playlist
     info.audio = audio;
+    if info.original_language.is_none() {
+        info.original_language = hls_orig_lang;
+    }
     info.hls_only = true;
     info.source = c.source;
     Ok(info)
@@ -314,7 +322,7 @@ fn hls_client(video_id: &str, c: HlsClient) -> Result<StreamInfo> {
 
 /// The variants of an HLS master playlist, as formats for the quality menu,
 /// plus its audio renditions (one per language, `audio_language` = display name).
-fn hls_variants(master_url: &str) -> Result<(Vec<StreamFormat>, Vec<StreamFormat>)> {
+fn hls_variants(master_url: &str) -> Result<(Vec<StreamFormat>, Vec<StreamFormat>, Option<String>)> {
     let text = http::get_text(master_url)?;
     let attr = |l: &str, k: &str| -> Option<String> {
         let rest = l.split(&format!("{k}=")).nth(1)?;
@@ -322,17 +330,26 @@ fn hls_variants(master_url: &str) -> Result<(Vec<StreamFormat>, Vec<StreamFormat
     };
     let mut out: Vec<StreamFormat> = Vec::new();
     let mut audio: Vec<StreamFormat> = Vec::new();
+    let mut hls_orig_lang: Option<String> = None;
     let mut lines = text.lines();
     while let Some(l) = lines.next() {
         if l.starts_with("#EXT-X-MEDIA") && l.contains("TYPE=AUDIO") {
-            if let Some(name) = hls_media_name(l) {
+            let lang_code = attr(l, "LANGUAGE").and_then(|c| clean_lang(&c)).unwrap_or_default();
+            let media_name = hls_media_name(l);
+            let is_orig = l.contains("acont=original")
+                || l.contains("acont%3Doriginal")
+                || media_name.as_deref().map(is_original_audio_label).unwrap_or(false);
+            if is_orig && !lang_code.is_empty() && hls_orig_lang.is_none() {
+                hls_orig_lang = Some(lang_code.clone());
+            }
+            if let Some(name) = media_name {
                 if !audio.iter().any(|a| a.audio_language.as_deref() == Some(name.as_str())) {
                     audio.push(StreamFormat {
                         mime: "audio/hls".into(),
                         is_audio: true,
-                        audio_default: name.to_lowercase().contains("original"),
+                        audio_default: is_orig,
                         // the rendition's language code
-                        quality_label: attr(l, "LANGUAGE").unwrap_or_default(),
+                        quality_label: lang_code,
                         audio_language: Some(name),
                         ..Default::default()
                     });
@@ -350,11 +367,14 @@ fn hls_variants(master_url: &str) -> Result<(Vec<StreamFormat>, Vec<StreamFormat
         let fps = attr(l, "FRAME-RATE").and_then(|f| f.parse::<f64>().ok()).unwrap_or(0.0) as u32;
         let bitrate = attr(l, "BANDWIDTH").and_then(|b| b.parse().ok()).unwrap_or(0);
         let class = quality_class(w, h);
-        // one entry per quality: keep the higher-bitrate variant
+        let codecs = attr(l, "CODECS").unwrap_or_default();
+        // one entry per quality: keep SDR over HDR, then the higher-bitrate variant
         if let Some(e) = out.iter_mut().find(|e| quality_class(e.width, e.height) == class && e.fps == fps) {
-            if bitrate > e.bitrate {
+            let key = |c: &str, b: u64| (!is_hdr_codecs(c), b);
+            if key(&codecs, bitrate) > key(&e.codecs, e.bitrate) {
                 e.bitrate = bitrate;
                 e.url = url.trim().to_string();
+                e.codecs = codecs;
             }
             continue;
         }
@@ -362,7 +382,7 @@ fn hls_variants(master_url: &str) -> Result<(Vec<StreamFormat>, Vec<StreamFormat
             itag: 0,
             url: url.trim().to_string(),
             mime: "application/vnd.apple.mpegurl".into(),
-            codecs: attr(l, "CODECS").unwrap_or_default(),
+            codecs,
             bitrate,
             width: w,
             height: h,
@@ -371,10 +391,23 @@ fn hls_variants(master_url: &str) -> Result<(Vec<StreamFormat>, Vec<StreamFormat
             ..Default::default()
         });
     }
+    let orig_lang = hls_orig_lang.or_else(|| {
+        audio
+            .iter()
+            .find(|a| a.audio_default && !a.quality_label.is_empty())
+            .or_else(|| {
+                if audio.len() == 1 {
+                    audio.first().filter(|a| !a.quality_label.is_empty())
+                } else {
+                    None
+                }
+            })
+            .map(|a| a.quality_label.clone())
+    });
     if audio.len() < 2 {
         audio.clear();
     }
-    Ok((out, audio))
+    Ok((out, audio, orig_lang))
 }
 
 /// NAME="..." of an #EXT-X-MEDIA line.
@@ -470,6 +503,109 @@ fn parse_format(f: &Value) -> Option<StreamFormat> {
     })
 }
 
+/// Returns true if an audio track display name marks YouTube's original track
+/// across localized UI languages (English, Turkish, Russian, CJK, Arabic, etc.).
+pub fn is_original_audio_label(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("original")
+        || lower.contains("orijinal")
+        || lower.contains("(orig)")
+        || lower.contains("оригинал")
+        || lower.contains("原声")
+        || lower.contains("オリジナル")
+        || lower.contains("원본")
+        || lower.contains("الأصلية")
+}
+
+/// Validates and normalizes an ISO language code, rejecting placeholders like `"und"` or `"zxx"`.
+fn clean_lang(code: &str) -> Option<String> {
+    let c = code.trim().trim_end_matches("-orig").trim();
+    if c.is_empty() {
+        return None;
+    }
+    let low = c.to_ascii_lowercase();
+    if matches!(low.as_str(), "und" | "zxx" | "mul" | "qaa" | "none" | "unknown") {
+        return None;
+    }
+    Some(c.to_string())
+}
+
+fn extract_xtag_lang(xtags: &str) -> Option<String> {
+    xtags
+        .split(':')
+        .find_map(|part| part.strip_prefix("lang="))
+        .and_then(clean_lang)
+}
+
+fn extract_innertube_original_lang(r: &Value) -> Option<String> {
+    if let Some(sd) = r.get("streamingData") {
+        let formats = sd
+            .get("adaptiveFormats")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .chain(sd.get("formats").and_then(Value::as_array).into_iter().flatten());
+
+        let mut default_lang: Option<String> = None;
+        for f in formats {
+            let mime = f.get("mimeType").and_then(Value::as_str).unwrap_or("");
+            if !mime.starts_with("audio") {
+                continue;
+            }
+            let xtags = f.get("xtags").and_then(Value::as_str).unwrap_or("");
+            let track_id = f.pointer("/audioTrack/id").and_then(Value::as_str).unwrap_or("");
+            let display = f.pointer("/audioTrack/displayName").and_then(Value::as_str).unwrap_or("");
+            let is_default = f.pointer("/audioTrack/audioIsDefault").and_then(Value::as_bool).unwrap_or(false);
+            let is_auto_dub = f.pointer("/audioTrack/isAutoDubbed").and_then(Value::as_bool).unwrap_or(false);
+
+            let lang = track_id
+                .split('.')
+                .next()
+                .and_then(clean_lang)
+                .or_else(|| extract_xtag_lang(xtags));
+
+            let Some(lang) = lang else { continue };
+
+            if xtags.contains("acont=original")
+                || is_original_audio_label(display)
+                || track_id.ends_with(".4")
+            {
+                return Some(lang);
+            }
+            if is_default && !is_auto_dub && default_lang.is_none() {
+                default_lang = Some(lang);
+            }
+        }
+        if default_lang.is_some() {
+            return default_lang;
+        }
+    }
+
+    if let Some(tracks) = r
+        .pointer("/captions/playerCaptionsTracklistRenderer/audioTracks")
+        .and_then(Value::as_array)
+    {
+        // Prefer canonical original audio track (suffix ".4") over localized defaultAudioTrackIndex
+        if let Some(lang) = tracks.iter().find_map(|tr| {
+            let id = tr.get("audioTrackId").and_then(Value::as_str)?;
+            id.ends_with(".4").then(|| id.split('.').next()).flatten().and_then(clean_lang)
+        }) {
+            return Some(lang);
+        }
+        if tracks.len() == 1 {
+            if let Some(lang) = tracks[0]
+                .get("audioTrackId")
+                .and_then(Value::as_str)
+                .and_then(|id| id.split('.').next())
+                .and_then(clean_lang)
+            {
+                return Some(lang);
+            }
+        }
+    }
+    None
+}
+
 fn parse_player(r: &Value) -> StreamInfo {
     let vd = r.get("videoDetails").cloned().unwrap_or(Value::Null);
     let sd = r.get("streamingData").cloned().unwrap_or(Value::Null);
@@ -517,6 +653,36 @@ fn parse_player(r: &Value) -> StreamInfo {
             auto: t.get("kind").and_then(Value::as_str) == Some("asr"),
         });
     }
+    info.original_language = extract_innertube_original_lang(r);
+    let def_audio_idx = r
+        .pointer("/captions/playerCaptionsTracklistRenderer/defaultAudioTrackIndex")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    info.default_caption_index = r
+        .pointer("/captions/playerCaptionsTracklistRenderer/audioTracks")
+        .and_then(Value::as_array)
+        .and_then(|tracks| {
+            let orig_track = tracks
+                .iter()
+                .find(|tr| tr.get("audioTrackId").and_then(Value::as_str).map(|id| id.ends_with(".4")).unwrap_or(false))
+                .or_else(|| {
+                    info.original_language.as_deref().and_then(|orig| {
+                        tracks.iter().find(|tr| {
+                            tr.get("audioTrackId")
+                                .and_then(Value::as_str)
+                                .and_then(|id| id.split('.').next())
+                                .map(|l| l.eq_ignore_ascii_case(orig))
+                                .unwrap_or(false)
+                        })
+                    })
+                })
+                .or_else(|| tracks.get(def_audio_idx));
+            orig_track
+                .and_then(|tr| tr.get("defaultCaptionTrackIndex"))
+                .and_then(Value::as_u64)
+                .map(|i| i as usize)
+                .filter(|&i| i < info.captions.len())
+        });
     if let Some(spec) = r
         .pointer("/storyboards/playerStoryboardSpecRenderer/spec")
         .and_then(Value::as_str)
@@ -617,9 +783,47 @@ pub fn hide_window(cmd: &mut Command) {
 }
 
 pub fn ytdlp_streams(video_id: &str) -> Result<StreamInfo> {
+    ytdlp_streams_with(video_id, None)
+}
+
+/// Whether YouTube refused an anonymous caller: a bot check, an age check, or
+/// a video only signed-in viewers may see.
+fn needs_sign_in(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    e.contains("not a bot") || e.contains("confirm your age") || e.contains("login_required") || e.contains("sign in to") || e.contains("age-restricted") || e.contains("--cookies")
+}
+
+/// yt-dlp with the browser sign-in's cookies, for videos YouTube only plays to a
+/// signed-in account. None when the browser sign-in isn't connected.
+fn ytdlp_signed_in(video_id: &str) -> Option<Result<StreamInfo>> {
+    let cookies = crate::api::web::write_cookies_file()?;
+    let res = ytdlp_streams_with(video_id, Some(&cookies));
+    let _ = std::fs::remove_file(&cookies);
+    Some(res)
+}
+
+/// Retries a resolution YouTube refused to an anonymous caller with the account.
+fn with_sign_in_fallback(video_id: &str, res: Result<StreamInfo>) -> Result<StreamInfo> {
+    match res {
+        Err(e) if needs_sign_in(&format!("{e:#}")) => match ytdlp_signed_in(video_id) {
+            Some(Ok(info)) => Ok(info),
+            Some(Err(e2)) => Err(anyhow!("{e}\nyt-dlp (signed in): {e2}")),
+            None if crate::api::auth::signed_in() => Err(anyhow!(
+                "{e}\nYouTube wants a signed-in viewer for this video. Connect “YouTube watch history” in Settings (it signs in through your browser) and Stream Tube will play it with your account through yt-dlp."
+            )),
+            None => Err(e),
+        },
+        other => other,
+    }
+}
+
+fn ytdlp_streams_with(video_id: &str, cookies: Option<&std::path::Path>) -> Result<StreamInfo> {
     let bin = ytdlp_path().ok_or_else(|| anyhow!("yt-dlp not found (install it or set its path in Settings)"))?;
     let mut cmd = Command::new(bin);
     cmd.args(["-J", "--no-warnings", "--no-playlist"]);
+    if let Some(c) = cookies {
+        cmd.arg("--cookies").arg(c);
+    }
     if let Some(p) = crate::store::proxy_setting() {
         cmd.arg("--proxy").arg(p);
     }
@@ -698,9 +902,15 @@ pub fn ytdlp_streams(video_id: &str) -> Result<StreamInfo> {
     for (lang, tracks, auto) in [("subtitles", &v["subtitles"], false), ("automatic_captions", &v["automatic_captions"], true)] {
         let _ = lang;
         if let Some(m) = tracks.as_object() {
+            let has_orig = auto && m.keys().any(|k| k.ends_with("-orig"));
             for (code, list) in m {
-                if auto && !code.ends_with("-orig") && info.captions.iter().any(|c| c.auto) {
-                    continue; // skip the huge list of auto-translations
+                if auto {
+                    if has_orig && !code.ends_with("-orig") {
+                        continue; // skip the huge list of auto-translations
+                    }
+                    if !has_orig && info.captions.iter().any(|c| c.auto) {
+                        continue;
+                    }
                 }
                 if let Some(vtt) = list.as_array().and_then(|a| a.iter().find(|x| s(x, "/ext").as_deref() == Some("vtt"))) {
                     info.captions.push(CaptionTrack {
@@ -713,6 +923,28 @@ pub fn ytdlp_streams(video_id: &str) -> Result<StreamInfo> {
             }
         }
     }
+    info.original_language = s(&v, "/language")
+        .and_then(|l| clean_lang(&l))
+        .or_else(|| {
+            v.get("formats")
+                .and_then(Value::as_array)
+                .and_then(|fmts| {
+                    fmts.iter()
+                        .filter(|f| {
+                            s(f, "/vcodec").as_deref() == Some("none")
+                                && s(f, "/language").and_then(|l| clean_lang(&l)).is_some()
+                        })
+                        .max_by_key(|f| f.get("language_preference").and_then(Value::as_i64).unwrap_or(i64::MIN))
+                        .and_then(|f| s(f, "/language"))
+                        .and_then(|l| clean_lang(&l))
+                })
+        })
+        .or_else(|| {
+            info.captions
+                .iter()
+                .find(|c| c.auto && c.lang.ends_with("-orig"))
+                .and_then(|c| clean_lang(&c.lang))
+        });
     sort_formats(&mut info);
     Ok(info)
 }
@@ -731,6 +963,15 @@ pub fn fmt_class(f: &StreamFormat) -> u32 {
     quality_class(f.width, f.height)
 }
 
+/// Whether a codecs string (one codec or an HLS `CODECS` list) is HDR video:
+/// VP9 profile 2 or 10-bit AV1. These look washed out here because the software
+/// render path converts them to RGB without tone mapping, so SDR is preferred.
+pub fn is_hdr_codecs(codecs: &str) -> bool {
+    codecs.to_lowercase().split(',').map(str::trim).any(|c| {
+        c.starts_with("vp9.2") || c.starts_with("vp09.02") || (c.starts_with("av01") && c.split('.').nth(3) == Some("10"))
+    })
+}
+
 pub fn pick_formats<'a>(
     info: &'a StreamInfo,
     max_height: u32,
@@ -747,6 +988,7 @@ pub fn pick_formats<'a>(
             _ => 0,
         }
     };
+    let sdr = |f: &StreamFormat| -> u8 { (!is_hdr_codecs(&f.codecs)) as u8 };
     let st = crate::store::settings_snapshot();
     // "Enhanced bitrate": the highest-bitrate stream at the chosen resolution, whatever its codec
     let enhanced = st.enhanced_bitrate;
@@ -754,7 +996,7 @@ pub fn pick_formats<'a>(
         .video
         .iter()
         .filter(|f| max_height == 0 || fmt_class(f) <= max_height)
-        .max_by_key(|f| if enhanced { (fmt_class(f), f.fps, f.bitrate as u32 / 1000, codec_rank(f)) } else { (fmt_class(f), f.fps, codec_rank(f), f.bitrate as u32 / 1000) })
+        .max_by_key(|f| if enhanced { (fmt_class(f), sdr(f), f.fps, f.bitrate as u32 / 1000, codec_rank(f)) } else { (fmt_class(f), sdr(f), f.fps, codec_rank(f), f.bitrate as u32 / 1000) })
         .or_else(|| info.video.iter().min_by_key(|f| fmt_class(f)));
     let audio = {
         let mut cands: Vec<&StreamFormat> = info.audio.iter().collect();
@@ -814,6 +1056,17 @@ mod tests {
         println!("{:?} {:?}", v.map(|v| (&v.quality_label, &v.codecs)), a.map(|a| &a.codecs));
         // HLS sources carry their audio in the manifest
         assert!(v.is_some() && (a.is_some() || s.hls_only));
+    }
+
+    #[test]
+    fn hdr_codecs() {
+        // yt-dlp names, Innertube/HLS names and HLS lists with audio
+        for hdr in ["vp9.2", "vp09.02.51.10.01.09.18.09.00", "av01.0.08M.10.0.110.09.18.09.0", "vp09.02.40.10.01.09.18.09.00,mp4a.40.2"] {
+            assert!(is_hdr_codecs(hdr), "{hdr}");
+        }
+        for sdr in ["vp9", "vp09.00.40.08", "av01.0.08M.08", "avc1.640028", "avc1.4D401F,mp4a.40.2", ""] {
+            assert!(!is_hdr_codecs(sdr), "{sdr}");
+        }
     }
 }
 

@@ -21,6 +21,9 @@ struct Entry {
 
 struct Proxy {
     port: u16,
+    /// Any local process can reach a loopback port, so every URL carries this
+    /// secret first and requests without it are refused.
+    token: String,
     streams: Mutex<HashMap<u64, Entry>>,
     next: Mutex<u64>,
 }
@@ -40,9 +43,30 @@ fn proxy() -> Option<&'static Proxy> {
                 }
             })
             .ok()?;
-        Some(Proxy { port, streams: Mutex::new(HashMap::new()), next: Mutex::new(0) })
+        let token = {
+            use rand::Rng;
+            let mut rng = rand::rng();
+            (0..24).map(|_| format!("{:02x}", rng.random::<u8>())).collect()
+        };
+        Some(Proxy { port, token, streams: Mutex::new(HashMap::new()), next: Mutex::new(0) })
     })
     .as_ref()
+}
+
+impl Proxy {
+    /// Where every local URL starts: the port and the secret.
+    fn base(&self) -> String {
+        format!("http://127.0.0.1:{}/{}", self.port, self.token)
+    }
+}
+
+/// The request path after the secret, or None when the secret is missing or wrong.
+fn strip_token<'a>(path: &'a str, token: &str) -> Option<&'a str> {
+    let rest = path.strip_prefix('/')?;
+    let given = rest.get(..token.len())?;
+    let same = given.bytes().zip(token.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+    let rest = &rest[token.len()..];
+    (same && rest.starts_with('/')).then_some(rest)
 }
 
 /// Marks entries served as HLS playlists / plain pass-through instead of ranged media.
@@ -73,7 +97,7 @@ pub fn local_url(url: &str, len: Option<u64>, mime: &str) -> String {
     }
     let Some(p) = proxy() else { return url.to_string() };
     let id = register(p, url, len, mime);
-    format!("http://127.0.0.1:{}/s/{id}", p.port)
+    format!("{}/s/{id}", p.base())
 }
 
 /// Serves an HLS master playlist to mpv through the proxy. Every playlist and
@@ -84,8 +108,8 @@ pub fn local_hls(url: &str, max_height: u32, audio: Option<&str>) -> String {
     let Some(p) = proxy() else { return url.to_string() };
     let id = register(p, url, None, HLS);
     match audio {
-        Some(a) => format!("http://127.0.0.1:{}/h/{id}?max={max_height}&audio={}", p.port, crate::api::http::urlencode(a)),
-        None => format!("http://127.0.0.1:{}/h/{id}?max={max_height}", p.port),
+        Some(a) => format!("{}/h/{id}?max={max_height}&audio={}", p.base(), crate::api::http::urlencode(a)),
+        None => format!("{}/h/{id}?max={max_height}", p.base()),
     }
 }
 
@@ -149,10 +173,10 @@ fn rewrite_master(p: &Proxy, text: &str, max_height: u32, audio_name: Option<&st
     let chosen = if fits.is_empty() {
         variants.iter().min_by_key(|(l, _)| (class(l), bw(l)))
     } else {
-        fits.into_iter().max_by_key(|(l, _)| (class(l), codec_rank(l), bw(l)))
+        fits.into_iter().max_by_key(|(l, _)| (class(l), !crate::api::streams::is_hdr_codecs(&hls_attr(l, "CODECS").unwrap_or_default()), codec_rank(l), bw(l)))
     };
     let Some((inf, uri)) = chosen else { return rewrite_playlist(p, text, max_height) };
-    let local_pl = |u: &str| format!("http://127.0.0.1:{}/h/{}?max=0", p.port, register(p, u, None, HLS));
+    let local_pl = |u: &str| format!("{}/h/{}?max=0", p.base(), register(p, u, None, HLS));
     let mut out = String::new();
     for h in header {
         out.push_str(h);
@@ -167,7 +191,7 @@ fn rewrite_master(p: &Proxy, text: &str, max_height: u32, audio_name: Option<&st
         let name_of = |m: &str| crate::api::streams::hls_media_name(m).unwrap_or_default();
         let audio = audio_name
             .and_then(|want| in_group.iter().find(|m| name_of(m) == want))
-            .or_else(|| in_group.iter().find(|m| name_of(m).to_lowercase().contains("original")))
+            .or_else(|| in_group.iter().find(|m| m.contains("acont=original") || m.contains("acont%3Doriginal") || crate::api::streams::is_original_audio_label(&name_of(m))))
             .or_else(|| in_group.iter().find(|m| hls_attr(m, "DEFAULT").as_deref() == Some("YES")))
             .or_else(|| in_group.first())
             .copied();
@@ -195,9 +219,9 @@ fn rewrite_master(p: &Proxy, text: &str, max_height: u32, audio_name: Option<&st
 fn rewrite_playlist(p: &Proxy, text: &str, max_height: u32) -> String {
     let local = |u: &str, playlist: bool| -> String {
         if playlist {
-            format!("http://127.0.0.1:{}/h/{}?max=0", p.port, register(p, u, None, HLS))
+            format!("{}/h/{}?max=0", p.base(), register(p, u, None, HLS))
         } else {
-            format!("http://127.0.0.1:{}/p/{}", p.port, register(p, u, None, PASS))
+            format!("{}/p/{}", p.base(), register(p, u, None, PASS))
         }
     };
     let lines: Vec<&str> = text.lines().collect();
@@ -326,21 +350,13 @@ fn serve_pass(conn: &mut TcpStream, url: &str, range: Option<(u64, Option<u64>)>
     conn.flush()
 }
 
-fn agent() -> &'static ureq::Agent {
-    static A: OnceLock<ureq::Agent> = OnceLock::new();
-    A.get_or_init(|| {
-        let mut b = ureq::Agent::config_builder()
+fn agent() -> ureq::Agent {
+    static AGENT: crate::api::http::NetworkAgent = crate::api::http::NetworkAgent::new();
+    AGENT.get(&crate::store::settings_snapshot(), |builder| {
+        builder
             .http_status_as_error(false)
-            .ip_family(crate::store::ip_family())
             .timeout_connect(Some(std::time::Duration::from_secs(10)))
-            .timeout_recv_body(Some(std::time::Duration::from_secs(30)));
-        // video data goes through the user's proxy too (HTTP or SOCKS)
-        if let Some(p) = crate::store::proxy_setting() {
-            if let Ok(proxy) = ureq::Proxy::new(&p) {
-                b = b.proxy(Some(proxy));
-            }
-        }
-        b.build().new_agent()
+            .timeout_recv_body(Some(std::time::Duration::from_secs(30)))
     })
 }
 
@@ -376,6 +392,9 @@ fn serve(mut conn: TcpStream) -> std::io::Result<()> {
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
     let Some(p) = proxy() else { return Ok(()) };
+    let Some(path) = strip_token(path, &p.token) else {
+        return conn.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    };
     if crate::perf::on() {
         eprintln!("[proxy] {method} {path} range={range:?}");
     }
@@ -502,4 +521,54 @@ fn serve(mut conn: TcpStream) -> std::io::Result<()> {
         }
     }
     conn.flush()
+}
+
+#[cfg(test)]
+mod token_tests {
+    #[test]
+    fn requests_need_the_secret() {
+        let t = "0123abcd";
+        assert_eq!(super::strip_token("/0123abcd/s/5", t), Some("/s/5"));
+        assert_eq!(super::strip_token("/s/5", t), None);
+        assert_eq!(super::strip_token("/0123abce/s/5", t), None);
+        assert_eq!(super::strip_token("/0123abcds/5", t), None);
+        assert_eq!(super::strip_token("/01", t), None);
+    }
+}
+
+#[cfg(test)]
+mod live_proxy_tests {
+    use std::io::Read;
+
+    fn get(url: &str) -> (u16, usize) {
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let mut r = agent.get(url).header("Range", "bytes=0-65535").call().unwrap();
+        let status = r.status().as_u16();
+        let mut buf = Vec::new();
+        let _ = r.body_mut().as_reader().take(65536).read_to_end(&mut buf);
+        (status, buf.len())
+    }
+
+    /// A real video through the proxy: served with the secret, refused without it.
+    #[test]
+    #[ignore = "network"]
+    fn serves_real_streams_only_with_the_secret() {
+        for id in ["dQw4w9WgXcQ", "bvMPTXaLq5k"] {
+            let info = crate::api::streams::get_streams(id).unwrap();
+            let url = if let Some(hls) = &info.hls_url {
+                super::local_hls(hls, 720, None)
+            } else {
+                let f = info.video.first().unwrap();
+                super::local_url(&f.url, f.content_length, &f.mime)
+            };
+            assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+            let (status, n) = get(&url);
+            eprintln!("{id}: {} via {} -> {status}, {n} bytes", info.source, &url[..url.len().min(90)]);
+            assert!((200..300).contains(&status) && n > 0, "{id}: {status}");
+            // the same path without the secret
+            let p = super::proxy().unwrap();
+            let bare = url.replacen(&format!("/{}", p.token), "", 1);
+            assert_eq!(get(&bare).0, 403);
+        }
+    }
 }
