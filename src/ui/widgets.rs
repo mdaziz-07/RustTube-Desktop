@@ -69,7 +69,7 @@ impl RenderOnce for PageScroll {
                     .inset_0()
                     .child(
                         Scrollbar::vertical(&self.handle)
-                            .id((self.id, "sb"))
+                            .id((ElementId::from(self.id), "sb"))
                             .mode(mode)
                             .viewport_from_layout(),
                     ),
