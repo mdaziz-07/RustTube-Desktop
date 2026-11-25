@@ -266,8 +266,6 @@ fn middle_click_tab(route: Route) -> impl Fn(&ClickEvent, &mut Window, &mut App)
 
 // ───────────────────────── grid card (home / subscriptions / channel) ─────────────────────────
 
-/// Starts resolving a video's streams when the pointer rests on its thumbnail,
-/// so playback begins almost immediately on click.
 thread_local! {
     static HOVER_FADES: std::cell::RefCell<std::collections::HashMap<String, (f32, std::time::Instant, bool)>> = Default::default();
 }
@@ -331,6 +329,8 @@ fn hover_bg_plate(key: String, thumb_url: String, inset: Pixels, radius: Pixels,
         )
 }
 
+/// Starts resolving a video's streams when the pointer rests on its thumbnail,
+/// so playback begins almost immediately on click.
 fn prefetch_hover(
     hover_key: String,
     id: &str,

@@ -1296,7 +1296,7 @@ impl PlayerView {
                     ctl_btn(
                         "c-theater",
                         "rectangle-horizontal",
-                        if theater { "Default view" } else { "Theater mode" },
+                        if store::settings_snapshot().theater_mode { "Default view" } else { "Theater mode" },
                     )
                     .on_click(|_, _, cx| {
                         crate::ui::app::toggle_theater_mode(cx);
