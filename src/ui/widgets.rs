@@ -541,7 +541,7 @@ pub fn selectable_text(id: impl Into<ElementId>, text: String, bold: bool, cx: &
             let items = vec![crate::ui::app::MenuItem::new("copy", t("Copy"), move |_, cx| {
                 crate::ui::copy_to_clipboard(t_copy.clone(), cx);
             })];
-            crate::ui::app::open_menu(ev.position(), items, window, cx);
+            crate::ui::app::open_menu(ev.position, items, window, cx);
         })
 }
 

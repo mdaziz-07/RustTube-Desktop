@@ -476,7 +476,7 @@ fn streams_download(job: &Job, dir: &std::path::Path, cancel: &AtomicBool, progr
             let mut af = std::fs::File::create(&a_tmp)?;
             crate::api::http::download_to(&a.url, &mut af, |done, total| {
                 let p = 0.85 + total.map(|t| (done as f32 / t as f32) * 0.1).unwrap_or(0.0);
-                progress(p, &format!("{0}{:.1} MB", translate("Audio, "), done as f64 / 1e6));
+                progress(p, &format!("{}{:.1} MB", translate("Audio, "), done as f64 / 1e6));
                 !cancel.load(Ordering::SeqCst)
             })?;
             Ok(())
