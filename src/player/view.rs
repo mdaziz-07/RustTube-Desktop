@@ -613,7 +613,7 @@ impl Render for PlayerView {
             return root.child(self.render_mini_controls(show, paused, time, duration, cx)).into_any_element();
         }
 
-        if let Some(video) = video.filter(|v| ui.shorts && !self.pip && v.is_short) {
+        if let Some(video) = video.as_ref().filter(|v| ui.shorts && !self.pip && v.is_short).cloned() {
             root = root.child(
                 icon_button("sh-download", "download", cx)
                     .absolute()

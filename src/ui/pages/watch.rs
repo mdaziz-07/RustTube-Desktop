@@ -1142,7 +1142,12 @@ impl WatchPage {
         let p = pal(cx);
         let cid = c.id.clone();
         let token = c.replies_token.clone();
-        let replies = self.replies.get(&c.id).cloned();
+        let replies_state: Option<Option<Result<(Vec<Comment>, Option<String>), String>>> = self.replies.get(&c.id).map(|r| match r {
+            Load::Loading => None,
+            Load::Error(e) => Some(Err(e.clone())),
+            Load::Ready((l, cont)) => Some(Ok((l.clone(), cont.clone()))),
+        });
+        let replies_open = replies_state.is_some();
         let author_id = c.author_id.clone();
         let replying_here = self.replying_to.as_deref() == Some(c.id.as_str());
         let reply_input_state = if replying_here {
@@ -1157,7 +1162,7 @@ impl WatchPage {
             .gap_4()
             .child({
                 let a = avatar(c.author_avatar.as_deref(), px(if is_reply { 24. } else { 40. }), &c.author, cx).into_any_element();
-                if thread || (!is_reply && replies.is_some()) {
+                if thread || (!is_reply && replies_open) {
                     // the thread line starts under the avatar of an opened comment
                     div().flex().flex_col().items_center().flex_none().child(a).child(div().flex_1().w(px(2.)).mt_1().bg(p.border)).into_any_element()
                 } else {
@@ -1301,7 +1306,7 @@ impl WatchPage {
                         )
                     })
                     .when_some(token.filter(|_| !is_reply), |d, tok| {
-                        let open = replies.is_some();
+                        let open = replies_open;
                         let cid2 = cid.clone();
                         d.child(
                             div().flex().child(
@@ -1333,12 +1338,7 @@ impl WatchPage {
                     }),
             )
             .into_any_element();
-        if let Some(r) = replies {
-            let r: Option<Result<(Vec<Comment>, Option<String>), String>> = match r {
-                Load::Loading => None,
-                Load::Error(e) => Some(Err(e)),
-                Load::Ready((l, c)) => Some(Ok((l, c))),
-            };
+        if let Some(r) = replies_state {
             let mut col = div().flex().flex_col();
             match r {
                 None => col = col.child(thread_branch(spinner(cx).into_any_element(), true, 40., p.border)),
