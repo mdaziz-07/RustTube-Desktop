@@ -103,6 +103,25 @@ pub fn apply_theme(window: Option<&mut Window>, cx: &mut App) {
     t.selection = p.accent.opacity(0.35);
     t.link = p.link;
     t.link_hover = p.link;
+    let mut code_block = StyleRefinement::default();
+    code_block.corner_radii.top_left = Some(px(6.).into());
+    code_block.corner_radii.top_right = Some(px(6.).into());
+    code_block.corner_radii.bottom_left = Some(px(6.).into());
+    code_block.corner_radii.bottom_right = Some(px(6.).into());
+    gpui_kit::base::TextViewDefaults::new()
+        .with_style(
+            gpui_kit::base::TextViewStyle::default()
+                .with_foreground(p.text)
+                .with_muted_foreground(p.text2)
+                .with_link(p.link)
+                .with_selection(p.accent.opacity(0.35))
+                .with_code_background(p.chip)
+                .with_border(p.border)
+                .with_code_block(code_block)
+                .with_dark(p.dark),
+        )
+        .with_inherit_text_color(true)
+        .install(cx);
     cx.refresh_windows();
 }
 

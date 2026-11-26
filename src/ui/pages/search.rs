@@ -138,8 +138,8 @@ impl Render for SearchPage {
         let s = store::settings_snapshot();
         let has_more = self.continuation.is_some();
         maybe_load_more(&self.scroll, &mut self.loading_more, has_more, cx, |this, cx| this.load_more(cx));
-        let width = content_width(cx).min(px(1280.));
-        let thumb_w = if width < px(900.) { px(240.) } else { px(360.) };
+        let width = content_width(cx);
+        let thumb_w = if width < px(900.) { px(260.) } else { (width * 0.34).clamp(px(380.), px(460.)) };
         let f = self.filter;
         let header = div()
             .flex()
@@ -232,11 +232,14 @@ impl Render for SearchPage {
         page_scroll("search-scroll", &self.scroll).child(
             div()
                 .flex()
-                .justify_center()
+                .flex_col()
+                .w(width)
                 .px_6()
                 .pt_4()
                 .pb_24()
-                .child(div().w(width).flex().flex_col().child(header).children(filters).child(body)),
+                .child(header)
+                .children(filters)
+                .child(body),
         )
     }
 }

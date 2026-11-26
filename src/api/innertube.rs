@@ -1010,12 +1010,57 @@ pub fn watch_next(video_id: &str, playlist_id: Option<&str>) -> Result<WatchInfo
                 }
             }
         }
-        w.description = sec
-            .pointer("/attributedDescription/content")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| opt_text(sec.get("description")))
-            .unwrap_or_default();
+        if let Some(attr) = sec.pointer("/attributedDescription") {
+            if let Some(raw) = attr.get("content").and_then(Value::as_str) {
+                let (norm, utf16_to_byte) = utf16_offsets_to_norm_bytes(raw);
+                if let Some(runs) = attr.get("commandRuns").and_then(Value::as_array) {
+                    for run in runs {
+                        let start = run.get("startIndex").and_then(Value::as_u64).unwrap_or(0) as usize;
+                        let len = run.get("length").and_then(Value::as_u64).unwrap_or(0) as usize;
+                        if len == 0 {
+                            continue;
+                        }
+                        let (Some(&b0), Some(&b1)) = (utf16_to_byte.get(start), utf16_to_byte.get(start + len)) else {
+                            continue;
+                        };
+                        if b0 >= b1 || !norm.is_char_boundary(b0) || !norm.is_char_boundary(b1) {
+                            continue;
+                        }
+                        let cmd = run.pointer("/onTap/innertubeCommand").unwrap_or(&Value::Null);
+                        let target = if let Some(b) = cmd.get("browseEndpoint") {
+                            let bid = b.get("browseId").and_then(Value::as_str).unwrap_or("");
+                            let canon = b.get("canonicalBaseUrl").and_then(Value::as_str).unwrap_or("");
+                            if bid.starts_with("UC") {
+                                Some(format!("st-channel:{bid}"))
+                            } else if let Some(pl) = bid.strip_prefix("VL") {
+                                Some(format!("https://www.youtube.com/playlist?list={pl}"))
+                            } else if !canon.is_empty() {
+                                if canon.starts_with('/') {
+                                    Some(format!("https://www.youtube.com{canon}"))
+                                } else {
+                                    Some(canon.to_string())
+                                }
+                            } else {
+                                None
+                            }
+                        } else if let Some(vid) = cmd.pointer("/watchEndpoint/videoId").and_then(Value::as_str) {
+                            Some(format!("https://www.youtube.com/watch?v={vid}"))
+                        } else if let Some(u) = cmd.pointer("/urlEndpoint/url").and_then(Value::as_str) {
+                            Some(unwrap_redirect_url(u))
+                        } else {
+                            None
+                        };
+                        if let Some(url) = target {
+                            w.description_links.push((b0..b1, url));
+                        }
+                    }
+                }
+                w.description = norm;
+            }
+        }
+        if w.description.is_empty() {
+            w.description = opt_text(sec.get("description")).unwrap_or_default().replace("\r\n", "\n");
+        }
     }
     // Related
     if let Some(sr) = results.pointer("/secondaryResults") {
@@ -1160,6 +1205,42 @@ pub fn chapters_from_description(desc: &str) -> Vec<Chapter> {
 
 // ───────────────────────── comments ─────────────────────────
 
+fn utf16_offsets_to_norm_bytes(raw: &str) -> (String, Vec<usize>) {
+    let mut norm = String::with_capacity(raw.len());
+    let mut map = Vec::with_capacity(raw.len() + 1);
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' && chars.peek() == Some(&'\n') {
+            map.push(norm.len());
+            continue;
+        }
+        let units = c.len_utf16();
+        let byte_idx = norm.len();
+        for _ in 0..units {
+            map.push(byte_idx);
+        }
+        norm.push(c);
+    }
+    map.push(norm.len());
+    (norm, map)
+}
+
+fn unwrap_redirect_url(url: &str) -> String {
+    if let Some((_, query)) = url.split_once('?') {
+        if url.contains("youtube.com/redirect") {
+            for kv in query.split('&') {
+                if let Some(("q", v)) = kv.split_once('=') {
+                    let dec = crate::api::http::urldecode(v);
+                    if !dec.is_empty() {
+                        return dec;
+                    }
+                }
+            }
+        }
+    }
+    url.to_string()
+}
+
 /// Channel (custom) emojis in a comment's text. Standard emojis are left alone:
 /// they're already Unicode characters in the text.
 fn comment_emojis(props: &Value) -> Vec<(String, String)> {
@@ -1191,12 +1272,17 @@ fn comment_emojis(props: &Value) -> Vec<(String, String)> {
 }
 
 pub fn comments(token: &str) -> Result<CommentPage> {
-    let r = call("next", json!({ "continuation": token }))?;
+    let r = if crate::api::web::connected() {
+        crate::api::web::web_call("next", json!({ "continuation": token })).or_else(|_| call("next", json!({ "continuation": token })))
+    } else {
+        call("next", json!({ "continuation": token }))
+    }?;
     let mut page = CommentPage::default();
     // entity payloads
     let mut payloads = std::collections::HashMap::new();
     let mut toolbar_states = std::collections::HashMap::new();
     let mut surfaces = std::collections::HashMap::new();
+    let mut toolbar_surfaces = std::collections::HashMap::new();
     if let Some(muts) = r.pointer("/frameworkUpdates/entityBatchUpdate/mutations").and_then(Value::as_array) {
         for m in muts {
             let key = m.get("entityKey").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -1206,6 +1292,8 @@ pub fn comments(token: &str) -> Result<CommentPage> {
                 toolbar_states.insert(key, p.clone());
             } else if let Some(p) = m.pointer("/payload/commentSurfaceEntityPayload") {
                 surfaces.insert(key, p.clone());
+            } else if let Some(p) = m.pointer("/payload/engagementToolbarSurfaceEntityPayload") {
+                toolbar_surfaces.insert(key, p.clone());
             }
         }
     }
@@ -1224,6 +1312,12 @@ pub fn comments(token: &str) -> Result<CommentPage> {
     for it in &lists {
         if let Some(h) = it.get("commentsHeaderRenderer") {
             page.count_text = opt_text(h.get("countText"));
+            if page.create_params.is_none() {
+                page.create_params = find(h, "createCommentEndpoint")
+                    .and_then(|e| e.get("createCommentParams"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
             if let Some(items) = h
                 .pointer("/sortMenu/sortFilterSubMenuRenderer/subMenuItems")
                 .and_then(Value::as_array)
@@ -1254,12 +1348,40 @@ pub fn comments(token: &str) -> Result<CommentPage> {
                 let author = p.get("author").cloned().unwrap_or(Value::Null);
                 let toolbar = p.get("toolbar").cloned().unwrap_or(Value::Null);
                 let state_key = vm.get("toolbarStateKey").and_then(Value::as_str).unwrap_or_default();
-                let hearted = toolbar_states
-                    .get(state_key)
+                let tb_state = toolbar_states.get(state_key);
+                let hearted = tb_state
                     .and_then(|s| s.get("heartState"))
                     .and_then(Value::as_str)
                     .map(|s| s.contains("HEARTED") && !s.contains("UNHEARTED"))
                     .unwrap_or(false);
+                let like_state = match tb_state.and_then(|s| s.get("likeState")).and_then(Value::as_str) {
+                    Some(v) if v.contains("DISLIKED") => -1,
+                    Some(v) if v.contains("LIKED") && !v.contains("INDIFFERENT") => 1,
+                    _ => 0,
+                };
+                let tb_surface = vm.get("toolbarSurfaceKey").and_then(Value::as_str).and_then(|k| toolbar_surfaces.get(k));
+                let action_of = |field: &str| -> Option<String> {
+                    tb_surface
+                        .and_then(|s| s.get(field))
+                        .and_then(|cmd| find(cmd, "performCommentActionEndpoint"))
+                        .and_then(|e| e.get("action"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                };
+                let reply_params = tb_surface
+                    .and_then(|s| s.get("replyCommand"))
+                    .and_then(|cmd| find(cmd, "createCommentReplyEndpoint"))
+                    .and_then(|e| e.get("createReplyParams"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let likes = if like_state == 1 {
+                    s(&toolbar, "/likeCountLiked").or_else(|| s(&toolbar, "/likeCountNotliked"))
+                } else {
+                    s(&toolbar, "/likeCountNotliked")
+                }
+                .unwrap_or_default()
+                .trim()
+                .to_string();
                 let replies_token = thread
                     .and_then(|t| t.pointer("/replies/commentRepliesRenderer/contents"))
                     .and_then(Value::as_array)
@@ -1272,7 +1394,7 @@ pub fn comments(token: &str) -> Result<CommentPage> {
                     author_avatar: s(&author, "/avatarThumbnailUrl"),
                     text: s(&props, "/content/content").unwrap_or_default(),
                     published: s(&props, "/publishedTime").unwrap_or_default(),
-                    likes: s(&toolbar, "/likeCountNotliked").unwrap_or_default().trim().to_string(),
+                    likes,
                     reply_count: s(&toolbar, "/replyCount").unwrap_or_default(),
                     replies_token,
                     is_creator: author.get("isCreator").and_then(Value::as_bool).unwrap_or(false),
@@ -1290,6 +1412,13 @@ pub fn comments(token: &str) -> Result<CommentPage> {
                             let ratio = a.get("aspectRatio").and_then(Value::as_f64).unwrap_or(1.0) as f32;
                             Some((url, ratio.clamp(0.2, 5.0)))
                         }),
+                    toolbar_state_key: (!state_key.is_empty()).then(|| state_key.to_string()),
+                    like_action: action_of("likeCommand"),
+                    unlike_action: action_of("unlikeCommand"),
+                    dislike_action: action_of("dislikeCommand"),
+                    undislike_action: action_of("undislikeCommand"),
+                    reply_params,
+                    like_state,
                 });
             }
         }
@@ -1298,6 +1427,50 @@ pub fn comments(token: &str) -> Result<CommentPage> {
         }
     }
     Ok(page)
+}
+
+fn check_comment_action_status(r: &Value) -> Result<()> {
+    if let Some(arr) = r.get("actionResults").and_then(Value::as_array) {
+        if let Some(err) = arr.iter().find(|a| a.get("status").and_then(Value::as_str) == Some("STATUS_FAILED")) {
+            let msg = opt_text(err.get("errorText")).unwrap_or_else(|| "Comment action failed".into());
+            return Err(anyhow!(msg));
+        }
+    }
+    Ok(())
+}
+
+fn comment_from_entity(p: &Value) -> Comment {
+    let props = p.get("properties").cloned().unwrap_or(Value::Null);
+    let author = p.get("author").cloned().unwrap_or(Value::Null);
+    Comment {
+        id: s(&props, "/commentId").unwrap_or_default(),
+        author: s(&author, "/displayName").unwrap_or_default(),
+        author_id: s(&author, "/channelId"),
+        author_avatar: s(&author, "/avatarThumbnailUrl"),
+        text: s(&props, "/content/content").unwrap_or_default(),
+        published: s(&props, "/publishedTime").unwrap_or_else(|| "Just now".into()),
+        emojis: comment_emojis(&props),
+        is_creator: author.get("isCreator").and_then(Value::as_bool).unwrap_or(false),
+        is_verified: author.get("isVerified").and_then(Value::as_bool).unwrap_or(false),
+        ..Default::default()
+    }
+}
+
+pub fn create_comment(params: &str, text: &str) -> Result<Option<Comment>> {
+    let r = crate::api::web::web_call("comment/create_comment", json!({ "createCommentParams": params, "commentText": text }))?;
+    check_comment_action_status(&r)?;
+    Ok(find(&r, "commentEntityPayload").map(comment_from_entity))
+}
+
+pub fn reply_comment(params: &str, text: &str) -> Result<Option<Comment>> {
+    let r = crate::api::web::web_call("comment/create_comment_reply", json!({ "createReplyParams": params, "commentText": text }))?;
+    check_comment_action_status(&r)?;
+    Ok(find(&r, "commentEntityPayload").map(comment_from_entity))
+}
+
+pub fn comment_action(action: &str) -> Result<()> {
+    let r = crate::api::web::web_call("comment/perform_comment_action", json!({ "actions": [action] }))?;
+    check_comment_action_status(&r)
 }
 
 // ───────────────────────── home / explore ─────────────────────────
@@ -1616,5 +1789,25 @@ mod channel_tab_tests {
         for k in ["featured", "videos", "shorts", "playlists"] {
             assert!(kinds.iter().any(|(_, kind)| kind == k), "no {k} tab in {kinds:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod description_run_tests {
+    #[test]
+    fn utf16_run_offsets_map_to_norm_bytes() {
+        let raw = "Hi 👋\r\nSubscribe:  / sonyliv  now";
+        let (norm, map) = super::utf16_offsets_to_norm_bytes(raw);
+        let idx = norm.find("/ sonyliv").unwrap();
+        let utf16_start = raw[..raw.find("/ sonyliv").unwrap()].encode_utf16().count();
+        let utf16_len = "/ sonyliv".encode_utf16().count();
+        assert_eq!(map[utf16_start], idx);
+        assert_eq!(map[utf16_start + utf16_len], idx + "/ sonyliv".len());
+    }
+
+    #[test]
+    fn unwraps_youtube_redirect_q() {
+        let u = "https://www.youtube.com/redirect?event=video_description&q=https%3A%2F%2Fexample.com%2Fa%3Fb%3D1";
+        assert_eq!(super::unwrap_redirect_url(u), "https://example.com/a?b=1");
     }
 }

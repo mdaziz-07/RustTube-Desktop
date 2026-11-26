@@ -1291,6 +1291,27 @@ impl Render for SettingsPage {
             Section::Data => this.data(cx),
             Section::About => this.about(cx),
         };
+        let render_layout = |nav: Div, body: Div| {
+            div()
+                .size_full()
+                .flex()
+                .pl_6()
+                .child(div().flex_none().pt_6().pr_8().child(nav))
+                .child(
+                    div().flex_1().min_w_0().h_full().child(
+                        page_scroll("settings-scroll", &self.scroll).child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .justify_center()
+                                .pt_6()
+                                .pr_6()
+                                .pb_24()
+                                .child(div().w_full().max_w(px(860.)).flex().flex_col().gap_4().child(body)),
+                        ),
+                    ),
+                )
+        };
         if !query.is_empty() {
             // search: matching rows from every section
             let mut all = div().flex().flex_col().gap_4();
@@ -1298,27 +1319,10 @@ impl Render for SettingsPage {
                 all = all.child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(p.text2).child(t(name).to_uppercase())).child(render_section(self, *sec, cx));
             }
             QUERY.with(|q| q.borrow_mut().clear());
-            return div()
-                .size_full()
-                .flex()
-                .justify_center()
-                .gap_8()
-                .px_6()
-                .pt_6()
-                .child(nav)
-                .child(
-                    div().flex_1().max_w(px(860.)).min_w_0().h_full().child(
-                        page_scroll("settings-scroll", &self.scroll).child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_4()
-                                .pb_24()
-                                .child(section_title(tf!("Results for “{0}”", query), cx).text_2xl())
-                                .child(all),
-                        ),
-                    ),
-                );
+            return render_layout(
+                nav,
+                div().flex().flex_col().gap_4().child(section_title(tf!("Results for “{0}”", query), cx).text_2xl()).child(all),
+            );
         }
         let content = match self.section {
             Section::General => self.general(cx),
@@ -1335,27 +1339,10 @@ impl Render for SettingsPage {
             Section::About => self.about(cx),
         };
         let title = SECTIONS.iter().find(|s| s.0 == self.section).map(|s| t(s.1)).unwrap_or("");
-        div()
-            .size_full()
-            .flex()
-            .justify_center()
-            .gap_8()
-            .px_6()
-            .pt_6()
-            .child(nav)
-            .child(
-                div().flex_1().max_w(px(860.)).min_w_0().h_full().child(
-                    page_scroll("settings-scroll", &self.scroll).child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_4()
-                            .pb_24()
-                            .child(section_title(title, cx).text_2xl())
-                            .child(content),
-                    ),
-                ),
-            )
+        render_layout(
+            nav,
+            div().flex().flex_col().gap_4().child(section_title(title, cx).text_2xl()).child(content),
+        )
     }
 }
 

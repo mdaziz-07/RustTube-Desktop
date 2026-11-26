@@ -437,13 +437,14 @@ impl Preview {
 
     fn start(&mut self, info: &crate::api::types::StreamInfo, cx: &mut Context<Self>) {
         self.info = Some(info.clone());
+        let st = store::settings_snapshot();
+        let target_q = if st.default_quality == 0 { 720 } else { st.default_quality };
         let src = if info.hls_only {
-            info.hls_url.as_deref().map(|u| crate::player::proxy::local_hls(u, 360, None))
+            info.hls_url.as_deref().map(|u| crate::player::proxy::local_hls(u, target_q, None))
         } else if info.is_live || (info.video.is_empty() && info.muxed.is_empty()) {
             info.hls_url.clone()
         } else {
-            let codec = store::settings_snapshot().codec_pref.clone();
-            let (v, a) = streams::pick_formats(info, 360, &codec, None);
+            let (v, a) = streams::pick_formats(info, target_q, &st.codec_pref, None);
             match v {
                 Some(v) => streams::mpv_source(Some(v), a, info.length_secs),
                 None => info.muxed.first().map(|m| m.url.clone()),
@@ -451,11 +452,17 @@ impl Preview {
         };
         let Some(src) = src else { return };
         let Some(m) = self.ensure_mpv(cx) else { return };
-        m.set_render_size(640, 360);
+        let (rw, rh) = match target_q {
+            0..=360 => (640, 360),
+            361..=480 => (854, 480),
+            481..=720 => (1280, 720),
+            _ => (1920, 1080),
+        };
+        m.set_render_size(rw, rh);
         m.set("aid", "auto");
         self.ready = false;
         m.set_flag("mute", self.muted);
-        m.set_f64("volume", store::settings_snapshot().volume);
+        m.set_f64("volume", st.volume);
         let _ = m.command(&["loadfile", &src, "replace", "-1", "pause=no"]);
     }
 

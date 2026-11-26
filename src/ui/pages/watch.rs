@@ -42,6 +42,12 @@ pub struct WatchPage {
     comment_sort_new: bool,
     /// "Timed" view: comments that mention a timestamp, shown once playback reaches it
     comment_timed: bool,
+    comment_input: Entity<InputState>,
+    comment_sending: bool,
+    _comment_input_sub: Subscription,
+    replying_to: Option<String>,
+    reply_input: Option<(String, Entity<InputState>, Subscription)>,
+    reply_sending: bool,
     /// While the timed view is open: refreshes it as playback moves and loads more
     /// comments to find timestamped ones. Dropped (stopped) when the view closes.
     timed_ticker: Option<Task<()>>,
@@ -50,6 +56,7 @@ pub struct WatchPage {
     replies: HashMap<String, Load<(Vec<Comment>, Option<String>)>>,
     related_more_loading: bool,
     scroll: ScrollHandle,
+    fs_desc_scroll: ScrollHandle,
     local_playlist: Option<(i64, String, Vec<VideoItem>)>,
     /// the queue list; it opens scrolled to the video playing (each video is a
     /// new page, so its scroll position isn't kept)
@@ -65,6 +72,7 @@ pub struct WatchPage {
 /// The chapters panel beside the player is open (toggled from the player's
 /// chapter title or the description; closed again for each new video).
 static CHAPTERS_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FULLSCREEN_DESC_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn toggle_chapters(cx: &mut App) {
     CHAPTERS_OPEN.fetch_xor(true, std::sync::atomic::Ordering::SeqCst);
@@ -73,6 +81,21 @@ pub fn toggle_chapters(cx: &mut App) {
 
 fn chapters_open() -> bool {
     CHAPTERS_OPEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub fn toggle_fullscreen_desc(cx: &mut App) {
+    FULLSCREEN_DESC_OPEN.fetch_xor(true, std::sync::atomic::Ordering::SeqCst);
+    cx.refresh_windows();
+}
+
+pub fn set_fullscreen_desc(open: bool, cx: &mut App) {
+    if FULLSCREEN_DESC_OPEN.swap(open, std::sync::atomic::Ordering::SeqCst) != open {
+        cx.refresh_windows();
+    }
+}
+
+pub fn fullscreen_desc_open() -> bool {
+    FULLSCREEN_DESC_OPEN.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Seeks to a chapter or timestamp and brings the player back into view.
@@ -121,6 +144,20 @@ impl WatchPage {
             pl.update(cx, |p, _| p.seek_to(t));
         }
         cx.set_global(AutoplayNext(None));
+        let web_signed_in = crate::api::web::connected();
+        let comment_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(translate(if web_signed_in {
+                "Add a comment…"
+            } else {
+                "Sign in (Browser) in Settings to comment"
+            }))
+        });
+        let comment_input_sub = cx.subscribe_in(&comment_input, window, |this: &mut Self, st, ev: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { .. } = ev {
+                let text = st.read(cx).value().to_string();
+                this.submit_comment(text, window, cx);
+            }
+        });
         let mut s = Self {
             id,
             playlist_id,
@@ -132,11 +169,18 @@ impl WatchPage {
             comments_more_loading: false,
             comment_sort_new: false,
             comment_timed: false,
+            comment_input,
+            comment_sending: false,
+            _comment_input_sub: comment_input_sub,
+            replying_to: None,
+            reply_input: None,
+            reply_sending: false,
             timed_ticker: None,
             timed_shown: 0,
             replies: HashMap::new(),
             related_more_loading: false,
             scroll: ScrollHandle::new(),
+            fs_desc_scroll: ScrollHandle::new(),
             local_playlist,
             queue_scroll: ScrollHandle::new(),
             queue_scrolled_to: None,
@@ -146,6 +190,7 @@ impl WatchPage {
             _sub: sub,
         };
         CHAPTERS_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
+        FULLSCREEN_DESC_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
         s.make_chat(window, cx);
         s.load(cx);
         s
@@ -482,6 +527,9 @@ impl WatchPage {
     }
 
     fn on_ended(&mut self, cx: &mut Context<Self>) {
+        if !crate::ui::app::is_current_page(cx.entity_id(), cx) {
+            return;
+        }
         let s = store::settings_snapshot();
         let next = cx.global::<AutoplayNext>().0.clone().filter(|_| s.autoplay_next);
         let looping = player(cx).read(cx).loop_video;
@@ -800,6 +848,7 @@ impl WatchPage {
         } else {
             w.description.lines().take(3).collect::<Vec<_>>().join("\n")
         };
+        let desc_links: Vec<_> = w.description_links.iter().filter(|(r, _)| r.end <= desc.len()).cloned().collect();
         let chapters = w.chapters.clone();
         div()
             .id("desc")
@@ -817,7 +866,7 @@ impl WatchPage {
                 }
             }))
             .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(format!("{views}  {}", w.date_text)))
-            .child(div().text_sm().text_color(p.text).child(rich_text("desc-text", desc, cx)))
+            .child(div().text_sm().text_color(p.text).child(rich_text_with_links("desc-text", desc, &[], &desc_links, cx)))
             .when(expanded && !chapters.is_empty() && !s.hide_chapters, |d| {
                 d.child(
                     div()
@@ -891,32 +940,218 @@ impl WatchPage {
             .into_any_element()
     }
 
-    fn render_comment(&mut self, c: &Comment, is_reply: bool, cx: &mut Context<Self>) -> AnyElement {
-        self.render_comment_t(c, is_reply, false, cx)
+    fn submit_comment(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let text = text.trim().to_string();
+        if text.is_empty() || self.comment_sending {
+            return;
+        }
+        if !crate::api::web::connected() {
+            warn_sign_in_for_comments("Connect Browser Sign-In in Settings to comment", cx);
+            return;
+        }
+        let params = match &self.comments {
+            Some(Load::Ready(p)) => p.create_params.clone(),
+            _ => None,
+        };
+        let Some(params) = params else {
+            toast(cx, translate("Reload comments after signing in to comment"));
+            return;
+        };
+        self.comment_sending = true;
+        self.comment_input.update(cx, |st, cx| st.set_value("", window, cx));
+        let sent_text = text.clone();
+        cx.spawn(async move |this, cx| {
+            let res = blocking(move || innertube::create_comment(&params, &sent_text)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.comment_sending = false;
+                match res {
+                    Ok(maybe) => {
+                        let author = crate::api::web::account_name().unwrap_or_else(|| "You".into());
+                        let new_c = maybe.unwrap_or_else(|| Comment {
+                            id: temp_comment_id("local"),
+                            author,
+                            text,
+                            published: "Just now".into(),
+                            ..Default::default()
+                        });
+                        if let Some(Load::Ready(page)) = &mut this.comments {
+                            page.comments.insert(0, new_c);
+                        }
+                        toast(cx, translate("Comment posted"));
+                    }
+                    Err(e) => {
+                        toast(cx, tf!("Could not post comment: {0}", e));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_reply(&mut self, cid: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.replying_to.as_deref() == Some(cid.as_str()) {
+            self.replying_to = None;
+            self.reply_input = None;
+            cx.notify();
+            return;
+        }
+        let cid_sub = cid.clone();
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(translate("Add a reply…")));
+        let sub = cx.subscribe_in(&input, window, move |this: &mut Self, st, ev: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { .. } = ev {
+                let text = st.read(cx).value().to_string();
+                this.submit_reply(cid_sub.clone(), text, window, cx);
+            }
+        });
+        let fh = input.read(cx).focus_handle(cx);
+        window.focus(&fh, cx);
+        self.replying_to = Some(cid.clone());
+        self.reply_input = Some((cid, input, sub));
+        cx.notify();
+    }
+
+    fn submit_reply(&mut self, parent_id: String, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let text = text.trim().to_string();
+        if text.is_empty() || self.reply_sending {
+            return;
+        }
+        if !crate::api::web::connected() {
+            warn_sign_in_for_comments("Connect Browser Sign-In in Settings to reply", cx);
+            return;
+        }
+        let params = self.find_comment_mut(&parent_id).and_then(|c| c.reply_params.clone());
+        let Some(params) = params else {
+            toast(cx, translate("Reload comments after signing in to reply"));
+            return;
+        };
+        self.reply_sending = true;
+        if let Some((_, inp, _)) = &self.reply_input {
+            inp.update(cx, |st, cx| st.set_value("", window, cx));
+        }
+        let sent_text = text.clone();
+        let pid = parent_id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = blocking(move || innertube::reply_comment(&params, &sent_text)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.reply_sending = false;
+                match res {
+                    Ok(maybe) => {
+                        let author = crate::api::web::account_name().unwrap_or_else(|| "You".into());
+                        let new_c = maybe.unwrap_or_else(|| Comment {
+                            id: temp_comment_id("local-reply"),
+                            author,
+                            text,
+                            published: "Just now".into(),
+                            ..Default::default()
+                        });
+                        match this.replies.get_mut(&pid) {
+                            Some(Load::Ready((list, _))) => list.push(new_c),
+                            _ => {
+                                this.replies.insert(pid.clone(), Load::Ready((vec![new_c], None)));
+                            }
+                        }
+                        this.replying_to = None;
+                        this.reply_input = None;
+                        toast(cx, translate("Reply posted"));
+                    }
+                    Err(e) => toast(cx, tf!("Could not post reply: {0}", e)),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn find_comment_mut(&mut self, id: &str) -> Option<&mut Comment> {
+        if let Some(Load::Ready(page)) = &mut self.comments {
+            if let Some(c) = page.comments.iter_mut().find(|c| c.id == id) {
+                return Some(c);
+            }
+        }
+        for load in self.replies.values_mut() {
+            if let Load::Ready((list, _)) = load {
+                if let Some(c) = list.iter_mut().find(|c| c.id == id) {
+                    return Some(c);
+                }
+            }
+        }
+        None
+    }
+
+    fn vote_comment(&mut self, comment_id: String, want: i8, cx: &mut Context<Self>) {
+        if !crate::api::web::connected() {
+            warn_sign_in_for_comments("Connect Browser Sign-In in Settings to vote on comments", cx);
+            return;
+        }
+        let Some(c) = self.find_comment_mut(&comment_id) else { return };
+        let old_state = c.like_state;
+        let next_state = if old_state == want { 0 } else { want };
+        let action = match (old_state, next_state) {
+            (_, 1) => c.like_action.clone(),
+            (1, 0) => c.unlike_action.clone(),
+            (_, -1) => c.dislike_action.clone(),
+            (-1, 0) => c.undislike_action.clone(),
+            _ => None,
+        };
+        let Some(action) = action else {
+            toast(cx, translate("Reload comments after signing in to vote"));
+            return;
+        };
+        let old_likes = c.likes.clone();
+        c.like_state = next_state;
+        c.likes = adjust_like_count(&old_likes, old_state, next_state);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = blocking(move || innertube::comment_action(&action)).await;
+            if let Err(e) = res {
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(c) = this.find_comment_mut(&comment_id) {
+                        c.like_state = old_state;
+                        c.likes = old_likes;
+                    }
+                    toast(cx, tf!("Comment action failed: {0}", e));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn render_comment(&mut self, c: &Comment, is_reply: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.render_comment_t(c, is_reply, false, window, cx)
     }
 
     /// A reply and, hanging under it, the replies that answer it.
-    fn reply_subtree(&mut self, list: &[Comment], parents: &[Option<usize>], i: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn reply_subtree(&mut self, list: &[Comment], parents: &[Option<usize>], i: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = pal(cx);
         let kids: Vec<usize> = (i + 1..list.len()).filter(|&j| parents[j] == Some(i)).collect();
-        let me = self.render_comment_t(&list[i], true, !kids.is_empty(), cx);
+        let me = self.render_comment_t(&list[i], true, !kids.is_empty(), window, cx);
         if kids.is_empty() {
             return me;
         }
         let mut col = div().flex().flex_col().child(me);
         for (k, &j) in kids.iter().enumerate() {
-            col = col.child(thread_branch(self.reply_subtree(list, parents, j, cx), k + 1 == kids.len(), 24., p.border));
+            col = col.child(thread_branch(self.reply_subtree(list, parents, j, window, cx), k + 1 == kids.len(), 24., p.border));
         }
         col.into_any_element()
     }
 
     /// `thread`: draw the thread line down from the avatar (replies hang below).
-    fn render_comment_t(&mut self, c: &Comment, is_reply: bool, thread: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_comment_t(&mut self, c: &Comment, is_reply: bool, thread: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = pal(cx);
         let cid = c.id.clone();
         let token = c.replies_token.clone();
-        let replies = self.replies.get(&c.id);
+        let replies = self.replies.get(&c.id).cloned();
         let author_id = c.author_id.clone();
+        let replying_here = self.replying_to.as_deref() == Some(c.id.as_str());
+        let reply_input_state = if replying_here {
+            self.reply_input.as_ref().filter(|(id, _, _)| id == &c.id).map(|(_, st, _)| st.clone())
+        } else {
+            None
+        };
+        let reply_sending = self.reply_sending;
+        let _ = window;
         let mut el = div()
             .flex()
             .gap_4()
@@ -965,13 +1200,106 @@ impl WatchPage {
                         div()
                             .flex()
                             .items_center()
-                            .gap_4()
+                            .gap_2()
                             .text_xs()
                             .text_color(p.text2)
-                            .child(div().flex().items_center().gap_1().child(icon("thumbs-up").size_4().text_color(p.text2)).child(c.likes.clone()))
-                            .child(icon("thumbs-down").size_4().text_color(p.text2))
-                            .when(c.hearted, |d| d.child(icon("heart").size_4().text_color(rgb(0xff0033)))),
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("clike-{}", c.id)))
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(p.hover))
+                                    .child(icon("thumbs-up").size_4().text_color(if c.like_state == 1 { p.accent } else { p.text2 }))
+                                    .when(!c.likes.is_empty(), |d| {
+                                        d.child(div().text_color(if c.like_state == 1 { p.accent } else { p.text2 }).child(c.likes.clone()))
+                                    })
+                                    .on_click({
+                                        let cid = cid.clone();
+                                        cx.listener(move |this, _, _, cx| this.vote_comment(cid.clone(), 1, cx))
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("cdislike-{}", c.id)))
+                                    .p_1p5()
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(p.hover))
+                                    .child(icon("thumbs-down").size_4().text_color(if c.like_state == -1 { p.accent } else { p.text2 }))
+                                    .on_click({
+                                        let cid = cid.clone();
+                                        cx.listener(move |this, _, _, cx| this.vote_comment(cid.clone(), -1, cx))
+                                    }),
+                            )
+                            .when(c.hearted, |d| d.child(icon("heart").size_4().text_color(rgb(0xff0033))))
+                            .when(!is_reply, |d| {
+                                let cid = cid.clone();
+                                d.child(
+                                    div()
+                                        .id(SharedString::from(format!("creply-{}", c.id)))
+                                        .px_2p5()
+                                        .py_1()
+                                        .rounded_full()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(p.text2)
+                                        .cursor_pointer()
+                                        .hover(move |s| s.bg(p.hover))
+                                        .child(translate("Reply"))
+                                        .on_click(cx.listener(move |this, _, window, cx| this.toggle_reply(cid.clone(), window, cx))),
+                                )
+                            }),
                     )
+                    .when_some(reply_input_state, |d, inp| {
+                        let cid_send = cid.clone();
+                        let inp_send = inp.clone();
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .pt_1()
+                                .child(div().flex_1().min_w_0().child(Input::new(&inp).disabled(reply_sending)))
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("creply-cancel-{}", c.id)))
+                                        .px_3()
+                                        .py_1p5()
+                                        .rounded_full()
+                                        .text_xs()
+                                        .text_color(p.text2)
+                                        .cursor_pointer()
+                                        .hover(move |s| s.bg(p.hover))
+                                        .child(translate("Cancel"))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.replying_to = None;
+                                            this.reply_input = None;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("creply-send-{}", c.id)))
+                                        .px_3()
+                                        .py_1p5()
+                                        .rounded_full()
+                                        .bg(p.accent)
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(white())
+                                        .cursor_pointer()
+                                        .child(translate("Reply"))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            let txt = inp_send.read(cx).value().to_string();
+                                            this.submit_reply(cid_send.clone(), txt, window, cx);
+                                        })),
+                                ),
+                        )
+                    })
                     .when_some(token.filter(|_| !is_reply), |d, tok| {
                         let open = replies.is_some();
                         let cid2 = cid.clone();
@@ -1008,8 +1336,8 @@ impl WatchPage {
         if let Some(r) = replies {
             let r: Option<Result<(Vec<Comment>, Option<String>), String>> = match r {
                 Load::Loading => None,
-                Load::Error(e) => Some(Err(e.clone())),
-                Load::Ready((l, c)) => Some(Ok((l.clone(), c.clone()))),
+                Load::Error(e) => Some(Err(e)),
+                Load::Ready((l, c)) => Some(Ok((l, c))),
             };
             let mut col = div().flex().flex_col();
             match r {
@@ -1021,7 +1349,7 @@ impl WatchPage {
                     let roots: Vec<usize> = (0..list.len()).filter(|&i| parents[i].is_none()).collect();
                     for (k, &i) in roots.iter().enumerate() {
                         let last = k + 1 == roots.len() && cont.is_none();
-                        col = col.child(thread_branch(self.reply_subtree(&list, &parents, i, cx), last, 40., p.border));
+                        col = col.child(thread_branch(self.reply_subtree(&list, &parents, i, window, cx), last, 40., p.border));
                     }
                     if let Some(tok) = cont {
                         let cid3 = cid.clone();
@@ -1046,7 +1374,7 @@ impl WatchPage {
         el
     }
 
-    fn render_comments(&mut self, w: &WatchInfo, cx: &mut Context<Self>) -> AnyElement {
+    fn render_comments(&mut self, w: &WatchInfo, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = pal(cx);
         if store::settings_snapshot().hide_comments {
             return div().into_any_element();
@@ -1062,39 +1390,83 @@ impl WatchPage {
         let sort_new = self.comment_sort_new;
         let timed = self.comment_timed;
         let (top, new) = (data.sort_top_token.clone(), data.sort_new_token.clone());
-        let mut col = div().flex().flex_col().gap_6().pt_6().child(
-            div()
-                .flex()
-                .items_center()
-                .gap_6()
-                .child(div().text_xl().font_weight(FontWeight::BOLD).text_color(p.text).child({
-                    let n = data.count_text.clone().or(w.comment_count_text.clone()).unwrap_or_default();
-                    if n.to_lowercase().contains("comment") { n } else { tf!("{0} Comments", n).trim().to_string() }
-                }))
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .when_some(top, |d, t| {
-                            d.child(chip("c-top", translate("Top"), !sort_new && !timed, cx).on_click(cx.listener(move |this, _, _, cx| {
-                                this.comment_sort_new = false;
-                                this.set_timed(false, cx);
-                                this.load_comments(t.clone(), false, cx);
-                            })))
-                        })
-                        .child(chip("c-timed", translate("Timed"), timed, cx).on_click(cx.listener(|this, _, _, cx| {
-                            let on = !this.comment_timed;
-                            this.set_timed(on, cx);
-                        })))
-                        .when_some(new, |d, t| {
-                            d.child(chip("c-new", translate("Newest"), sort_new && !timed, cx).on_click(cx.listener(move |this, _, _, cx| {
-                                this.comment_sort_new = true;
-                                this.set_timed(false, cx);
-                                this.load_comments(t.clone(), false, cx);
-                            })))
-                        }),
-                ),
+        let web_signed_in = crate::api::web::connected();
+        localize_placeholder(
+            &self.comment_input,
+            if web_signed_in {
+                "Add a comment…"
+            } else {
+                "Sign in (Browser) in Settings to comment"
+            },
+            window,
+            cx,
         );
+        let composer = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(div().flex_1().min_w_0().child(Input::new(&self.comment_input).disabled(self.comment_sending)))
+            .child(
+                div()
+                    .id("c-submit")
+                    .px_4()
+                    .py_2()
+                    .rounded_full()
+                    .bg(if web_signed_in { p.accent } else { p.chip })
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(if web_signed_in { white().into() } else { p.text2 })
+                    .cursor_pointer()
+                    .hover(move |s| s.opacity(0.9))
+                    .child(translate(if web_signed_in { "Comment" } else { "Sign in" }))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if !crate::api::web::connected() {
+                            crate::ui::app::navigate(Route::Settings, window, cx);
+                            return;
+                        }
+                        let txt = this.comment_input.read(cx).value().to_string();
+                        this.submit_comment(txt, window, cx);
+                    })),
+            );
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap_6()
+            .pt_6()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_6()
+                    .child(div().text_xl().font_weight(FontWeight::BOLD).text_color(p.text).child({
+                        let n = data.count_text.clone().or(w.comment_count_text.clone()).unwrap_or_default();
+                        if n.to_lowercase().contains("comment") { n } else { tf!("{0} Comments", n).trim().to_string() }
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .when_some(top, |d, t| {
+                                d.child(chip("c-top", translate("Top"), !sort_new && !timed, cx).on_click(cx.listener(move |this, _, _, cx| {
+                                    this.comment_sort_new = false;
+                                    this.set_timed(false, cx);
+                                    this.load_comments(t.clone(), false, cx);
+                                })))
+                            })
+                            .child(chip("c-timed", translate("Timed"), timed, cx).on_click(cx.listener(|this, _, _, cx| {
+                                let on = !this.comment_timed;
+                                this.set_timed(on, cx);
+                            })))
+                            .when_some(new, |d, t| {
+                                d.child(chip("c-new", translate("Newest"), sort_new && !timed, cx).on_click(cx.listener(move |this, _, _, cx| {
+                                    this.comment_sort_new = true;
+                                    this.set_timed(false, cx);
+                                    this.load_comments(t.clone(), false, cx);
+                                })))
+                            }),
+                    ),
+            )
+            .child(composer);
         if timed {
             // like youtube.com: a comment shows up once the video reaches the moment
             // it's about, the latest one on top
@@ -1149,12 +1521,12 @@ impl WatchPage {
                                     })
                                 }),
                         )
-                        .child(div().flex_1().min_w_0().child(self.render_comment(c, false, cx))),
+                        .child(div().flex_1().min_w_0().child(self.render_comment(c, false, window, cx))),
                 );
             }
         } else {
             for c in &data.comments {
-                col = col.child(self.render_comment(c, false, cx));
+                col = col.child(self.render_comment(c, false, window, cx));
             }
         }
         if data.continuation.is_some() && self.comments_more_loading {
@@ -1449,6 +1821,89 @@ impl WatchPage {
         }
         col.into_any_element()
     }
+
+    fn render_fullscreen_description(&mut self, w: &WatchInfo, cx: &mut Context<Self>) -> AnyElement {
+        let p = pal(cx);
+        let s = store::settings_snapshot();
+        let views = if s.hide_view_counts { String::new() } else { w.views_text.clone() };
+        let cid = w.channel.id.clone();
+        let meta = if views.is_empty() {
+            w.date_text.clone()
+        } else if w.date_text.is_empty() {
+            views
+        } else {
+            format!("{views} • {}", w.date_text)
+        };
+        div()
+            .id("fs-desc-panel")
+            .w(px(400.))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .bg(p.bg)
+            .border_l_1()
+            .border_color(p.border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(p.border)
+                    .child(div().text_base().font_weight(FontWeight::BOLD).text_color(p.text).child(translate("Description")))
+                    .child(icon_button("fs-desc-close", "x", cx).on_click(|_, _, cx| set_fullscreen_desc(false, cx))),
+            )
+            .child(
+                nested_scroll(
+                    "fs-desc-scroll",
+                    div()
+                        .id("fs-desc-body")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.fs_desc_scroll)
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .child(div().text_base().font_weight(FontWeight::BOLD).text_color(p.text).child(w.title.clone()))
+                        .child(
+                            div()
+                                .id("fs-desc-chan")
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .cursor_pointer()
+                                .on_click(move |_, window, cx| navigate(Route::Channel(cid.clone()), window, cx))
+                                .child(avatar(w.channel.avatar.as_deref(), px(36.), &w.channel.name, cx))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(w.channel.name.clone()))
+                                        .when_some(w.channel.subscribers_text.clone(), |d, t| d.child(div().text_xs().text_color(p.text2).child(t))),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .p_3()
+                                .rounded_xl()
+                                .bg(p.chip)
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .when(!meta.is_empty(), |d| d.child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(meta)))
+                                .child(div().text_sm().text_color(p.text).child(rich_text_with_links("fs-desc-text", w.description.clone(), &[], &w.description_links, cx))),
+                        ),
+                )
+                .flex_1()
+                .min_h_0(),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for WatchPage {
@@ -1474,6 +1929,17 @@ impl Render for WatchPage {
             }
         }
         if ui.fullscreen {
+            if fullscreen_desc_open() {
+                if let Some(w) = self.info.ready().cloned() {
+                    return div()
+                        .size_full()
+                        .flex()
+                        .bg(black())
+                        .child(div().flex_1().h_full().min_w_0().bg(black()).child(crate::ui::slot::player_slot(cx)))
+                        .child(self.render_fullscreen_description(&w, cx))
+                        .into_any_element();
+                }
+            }
             return div().size_full().bg(black()).child(crate::ui::slot::player_slot(cx)).into_any_element();
         }
         let vp = ui.viewport;
@@ -1494,7 +1960,7 @@ impl Render for WatchPage {
         let primary_info: AnyElement = match (&self.info, &info) {
             (_, Some(w)) => {
                 let i = self.render_info(w, cx);
-                let c = self.render_comments(w, cx);
+                let c = self.render_comments(w, window, cx);
                 div().flex().flex_col().child(i).child(c).into_any_element()
             }
             (Load::Error(e), _) => div().py_4().text_color(p.text2).child(tf!("Could not load video details: {0}", e)).into_any_element(),
@@ -1696,12 +2162,49 @@ fn merge_playlist_window(queue: &mut Vec<VideoItem>, pos: &mut Option<usize>, wi
     queue.extend(later.collect::<Vec<_>>());
 }
 
+fn warn_sign_in_for_comments(msg: &'static str, cx: &mut App) {
+    crate::ui::toast_with_action(
+        cx,
+        translate(msg),
+        Some((
+            translate("Settings").into(),
+            std::sync::Arc::new(|w, cx| crate::ui::app::navigate(Route::Settings, w, cx)),
+        )),
+    );
+}
+
+fn temp_comment_id(prefix: &str) -> String {
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+    format!("{prefix}-{ms}")
+}
+
+/// Optimistically updates a plain numeric comment like count on like/unlike.
+fn adjust_like_count(cur: &str, old: i8, new: i8) -> String {
+    let trimmed = cur.trim();
+    if trimmed.chars().any(|c| c.is_alphabetic()) {
+        return cur.to_string();
+    }
+    let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+    let base: i64 = if digits.is_empty() { 0 } else { digits.parse().unwrap_or(0) };
+    let delta = (if new == 1 { 1 } else { 0 }) - (if old == 1 { 1 } else { 0 });
+    let next = (base + delta).max(0) as u64;
+    if next == 0 { String::new() } else { vote_count(next) }
+}
+
 #[cfg(test)]
 mod queue_merge_tests {
     use super::*;
 
     fn vids(ids: std::ops::Range<u32>) -> Vec<VideoItem> {
         ids.map(|i| VideoItem { id: i.to_string(), ..Default::default() }).collect()
+    }
+
+    #[::core::prelude::v1::test]
+    fn like_count_adjusts_cleanly() {
+        assert_eq!(adjust_like_count("", 0, 1), "1");
+        assert_eq!(adjust_like_count("1", 1, 0), "");
+        assert_eq!(adjust_like_count("999", 0, 1), "1,000");
+        assert_eq!(adjust_like_count("1.4K", 0, 1), "1.4K");
     }
 
     #[::core::prelude::v1::test]

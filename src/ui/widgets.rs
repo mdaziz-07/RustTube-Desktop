@@ -370,9 +370,38 @@ fn md_escape(t: &str, out: &mut String) {
 /// Plain text with links, timestamps, #hashtags and @handles as Markdown links
 /// (app-internal schemes for the non-URL ones), line breaks kept.
 fn to_markdown(text: &str) -> String {
+    to_markdown_with_links(text, &[])
+}
+
+fn tokens_with_links(text: &str, extra_links: &[(std::ops::Range<usize>, String)]) -> Vec<(std::ops::Range<usize>, Token)> {
+    let mut merged: Vec<(std::ops::Range<usize>, Token)> = Vec::new();
+    for (r, url) in extra_links {
+        if r.start < r.end && r.end <= text.len() && text.is_char_boundary(r.start) && text.is_char_boundary(r.end) {
+            merged.push((r.clone(), Token::Url(url.clone())));
+        }
+    }
+    for (r, tok) in tokenize(text) {
+        let overlaps = merged.iter().any(|(er, _)| r.start < er.end && er.start < r.end);
+        if !overlaps {
+            merged.push((r, tok));
+        }
+    }
+    merged.sort_by_key(|(r, _)| (r.start, r.end));
+    let mut dedup = Vec::with_capacity(merged.len());
+    let mut last = 0;
+    for (r, tok) in merged {
+        if r.start >= last {
+            last = r.end;
+            dedup.push((r, tok));
+        }
+    }
+    dedup
+}
+
+fn to_markdown_with_links(text: &str, extra_links: &[(std::ops::Range<usize>, String)]) -> String {
     let mut md = String::with_capacity(text.len() + 64);
     let mut last = 0;
-    for (r, tok) in tokenize(text) {
+    for (r, tok) in tokens_with_links(text, extra_links) {
         md_escape(&text[last..r.start], &mut md);
         let label = &text[r.clone()];
         md.push('[');
@@ -406,25 +435,52 @@ fn open_link(url: &str, window: &mut Window, cx: &mut App) {
         });
         // back up to the player, like YouTube does
         scroll_page_key("home", false, window);
+    } else if let Some(cid) = url.strip_prefix("st-channel:") {
+        let id = crate::api::http::urldecode(cid).trim().to_string();
+        if !id.is_empty() {
+            crate::ui::app::navigate(crate::ui::app::Route::Channel(id), window, cx);
+        }
     } else if let Some(h) = url.strip_prefix("st-tag:") {
         crate::ui::app::navigate(crate::ui::app::Route::Search(crate::api::http::urldecode(h)), window, cx);
     } else if let Some(h) = url.strip_prefix("st-handle:") {
         let raw = crate::api::http::urldecode(h);
-        let clean = raw.trim_start_matches('@').trim_start_matches('/').trim().to_string();
+        let clean: String = raw
+            .trim()
+            .trim_start_matches('/')
+            .trim()
+            .trim_start_matches('@')
+            .chars()
+            .filter(|c| !matches!(c, '\u{200e}' | '\u{200f}' | '\u{2066}'..='\u{2069}'))
+            .collect();
+        let clean = clean.trim().to_string();
+        if clean.is_empty() {
+            return;
+        }
         cx.spawn(async move |cx| {
-            let url1 = format!("https://www.youtube.com/@{clean}");
-            let url2 = format!("https://www.youtube.com/{clean}");
+            let candidates = [
+                format!("https://www.youtube.com/@{clean}"),
+                format!("https://www.youtube.com/{clean}"),
+                format!("https://www.youtube.com/c/{clean}"),
+                format!("https://www.youtube.com/user/{clean}"),
+            ];
             let res = blocking(move || {
-                crate::api::innertube::resolve_url(&url1)
-                    .or_else(|_| crate::api::innertube::resolve_url(&url2))
-            }).await;
-            if let Ok(crate::api::innertube::ResolvedUrl::Channel(id)) = res {
-                let _ = cx.update(|cx| {
+                for u in &candidates {
+                    if let Ok(r) = crate::api::innertube::resolve_url(u) {
+                        return Ok(r);
+                    }
+                }
+                Err(anyhow::anyhow!("Channel not found"))
+            })
+            .await;
+            let _ = cx.update(|cx| {
+                if let Ok(crate::api::innertube::ResolvedUrl::Channel(id)) = res {
                     if let Some(w) = cx.active_window() {
                         let _ = w.update(cx, |_, window, cx| crate::ui::app::navigate(crate::ui::app::Route::Channel(id), window, cx));
                     }
-                });
-            }
+                } else {
+                    crate::ui::toast(cx, crate::i18n::t("Could not open channel link"));
+                }
+            });
         })
         .detach();
     } else if let Some(r) = crate::api::innertube::parse_youtube_url(url) {
@@ -442,15 +498,32 @@ fn open_link(url: &str, window: &mut Window, cx: &mut App) {
 /// Selectable text (drag to select, Ctrl+C) with clickable links, timestamps,
 /// hashtags and handles. Right-click copies the whole text.
 pub fn rich_text(id: impl Into<ElementId>, text: String, cx: &App) -> AnyElement {
-    rich_text_with(id, text, &[], cx)
+    rich_text_with_links(id, text, &[], &[], cx)
 }
 
 /// [`rich_text`] with channel emojis (shortcut, image URL) drawn inline as images.
 pub fn rich_text_with(id: impl Into<ElementId>, text: String, emojis: &[(String, String)], cx: &App) -> AnyElement {
+    rich_text_with_links(id, text, emojis, &[], cx)
+}
+
+/// [`rich_text`] with inline channel emojis and explicit `commandRuns` links.
+pub fn rich_text_with_links(
+    id: impl Into<ElementId>,
+    text: String,
+    emojis: &[(String, String)],
+    extra_links: &[(std::ops::Range<usize>, String)],
+    cx: &App,
+) -> AnyElement {
     let p = pal(cx);
-    let urls: Vec<String> = tokenize(&text).into_iter().filter_map(|(_, t)| if let Token::Url(u) = t { Some(u) } else { None }).collect();
+    let urls: Vec<String> = tokens_with_links(&text, extra_links)
+        .into_iter()
+        .filter_map(|(_, t)| match t {
+            Token::Url(u) if !u.starts_with("st-") => Some(u),
+            _ => None,
+        })
+        .collect();
     let md = if emojis.is_empty() {
-        to_markdown(&text)
+        to_markdown_with_links(&text, extra_links)
     } else {
         // swap each shortcut for a marker the Markdown conversion leaves alone,
         // then the marker for an inline image
@@ -466,11 +539,19 @@ pub fn rich_text_with(id: impl Into<ElementId>, text: String, emojis: &[(String,
         }
         md
     };
+    let text_style = gpui_kit::base::TextViewStyle::default()
+        .with_foreground(p.text)
+        .with_muted_foreground(p.text2)
+        .with_link(p.link)
+        .with_selection(p.accent.opacity(0.35))
+        .with_code_background(p.chip)
+        .with_border(p.border)
+        .with_dark(p.dark);
     let view = gpui_kit::base::TextView::markdown(id, md)
+        .style(text_style)
         .selectable(true)
         .on_link_click(|url, _, window, cx| open_link(url, window, cx));
     let copy_text = text.clone();
-    let _ = p;
     div()
         .w_full()
         .child(view)
@@ -587,6 +668,14 @@ mod clamp_tests {
         assert_eq!(handles.len(), 2);
         assert_eq!(handles[0].1, "sonyliv");
         assert_eq!(handles[1].1, "@youtube");
+    }
+
+    #[test]
+    fn merges_extra_links_over_tokens() {
+        let text = "Visit  / Sony LIV  today";
+        let extra = vec![(7..17, "st-channel:UC12345".to_string())];
+        let md = to_markdown_with_links(text, &extra);
+        assert!(md.contains("(st-channel:UC12345)") || md.contains("(<st-channel:UC12345>)"));
     }
 }
 

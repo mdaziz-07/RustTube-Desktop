@@ -699,6 +699,44 @@ impl Render for PlayerView {
             self.vol_hover = false;
         }
         if show {
+            if ui.fullscreen && !mini && !self.pip {
+                if let Some(title) = video.as_ref().map(|v| v.title.clone()).filter(|t| !t.is_empty()) {
+                    let desc_open = crate::ui::pages::watch::fullscreen_desc_open();
+                    root = root.child(
+                        div()
+                            .id("fs-title")
+                            .absolute()
+                            .top_4()
+                            .left_4()
+                            .max_w(px(760.))
+                            .px_3()
+                            .py_2()
+                            .rounded_xl()
+                            .cursor_pointer()
+                            .when(desc_open, |d| d.bg(hsla(0., 0., 1., 0.14)))
+                            .hover(|s| s.bg(hsla(0., 0., 1., 0.18)))
+                            .tooltip(move |window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(translate(if desc_open {
+                                    "Hide description"
+                                } else {
+                                    "Description"
+                                }))
+                                .build(window, cx)
+                            })
+                            .tooltip_show_delay(Duration::from_millis(800))
+                            .on_hover(cx.listener(|this, h: &bool, _, cx| {
+                                this.hovering_controls = *h;
+                                this.poke(cx);
+                            }))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(|_, _, cx| {
+                                cx.stop_propagation();
+                                crate::ui::pages::watch::toggle_fullscreen_desc(cx);
+                            })
+                            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).text_color(white()).truncate().child(title)),
+                    );
+                }
+            }
             root = root.child(self.render_controls(time, duration, player_radius, ui, window, cx));
         }
         if let Some(m) = self.menu {
@@ -1268,16 +1306,12 @@ impl PlayerView {
                     .when(vol_open, |d| d.child(
                         div()
                             .id("vol-slider")
-                            .relative()
-                            .w(if compact { px(40.) } else { px(64.) })
-                            .h(px(4.))
-                            .mx_2()
-                            .rounded_full()
-                            .bg(hsla(0., 0., 1., 0.3))
+                            .flex()
+                            .items_center()
+                            .h(px(28.))
+                            .px_1()
+                            .mx_1()
                             .cursor_pointer()
-                            .child(canvas(move |b, _, _| vol_b.set(b), |_, _, _, _| {}).absolute().size_full())
-                            .child(div().h_full().rounded_full().w(relative(vol_frac)).bg(white()))
-                            .child(div().absolute().top(px(-4.)).left(relative(vol_frac)).ml(px(-6.)).size(px(12.)).rounded_full().bg(white()))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, ev: &MouseDownEvent, _, cx| {
@@ -1287,6 +1321,18 @@ impl PlayerView {
                                     this.player.update(cx, |p, _| p.set_volume(f as f64 * 100.0));
                                     cx.notify();
                                 }),
+                            )
+                            .child(
+                                div()
+                                    .relative()
+                                    .w(if compact { px(40.) } else { px(64.) })
+                                    .h(px(4.))
+                                    .rounded_full()
+                                    .bg(hsla(0., 0., 1., 0.3))
+                                    .cursor_pointer()
+                                    .child(canvas(move |b, _, _| vol_b.set(b), |_, _, _, _| {}).absolute().size_full())
+                                    .child(div().h_full().rounded_full().w(relative(vol_frac)).bg(white()))
+                                    .child(div().absolute().top(px(-4.)).left(relative(vol_frac)).ml(px(-6.)).size(px(12.)).rounded_full().bg(white())),
                             ),
                     )),
             )

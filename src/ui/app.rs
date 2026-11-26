@@ -235,6 +235,9 @@ pub fn toggle_fullscreen(window: &mut Window, cx: &mut App) {
         ui.windowed = false;
     } else {
         ui.fullscreen = !ui.fullscreen;
+        if !ui.fullscreen {
+            crate::ui::pages::watch::set_fullscreen_desc(false, cx);
+        }
     }
     cx.refresh_windows();
 }
@@ -251,6 +254,7 @@ pub fn toggle_windowed_fullscreen(window: &mut Window, cx: &mut App) {
     if ui.windowed {
         ui.windowed = false;
         ui.fullscreen = false;
+        crate::ui::pages::watch::set_fullscreen_desc(false, cx);
     } else if ui.fullscreen {
         // real fullscreen -> windowed fullscreen
         window.toggle_fullscreen();
@@ -264,6 +268,7 @@ pub fn toggle_windowed_fullscreen(window: &mut Window, cx: &mut App) {
 
 /// Leaves either kind of fullscreen.
 pub fn exit_fullscreen(window: &mut Window, cx: &mut App) {
+    crate::ui::pages::watch::set_fullscreen_desc(false, cx);
     let ui = cx.global_mut::<UiState>();
     if ui.windowed {
         ui.windowed = false;
@@ -3086,7 +3091,7 @@ impl AppView {
             .flex()
             .flex_col()
             .gap_2()
-            .children(toasts.into_iter().map(|t| {
+            .children(toasts.into_iter().rev().map(|t| {
                 let anim_id = SharedString::from(format!("toast-in-{}", t.id));
                 div()
                     .flex()

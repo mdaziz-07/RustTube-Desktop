@@ -80,6 +80,8 @@ pub struct WatchInfo {
     pub date_text: String,
     pub likes_text: Option<String>,
     pub description: String,
+    /// Structured commandRuns links from attributedDescription: (byte_range_in_description, url).
+    pub description_links: Vec<(std::ops::Range<usize>, String)>,
     pub channel: ChannelItem,
     pub chapters: Vec<Chapter>,
     /// "Most replayed" graph: (start s, duration s, intensity 0..1)
@@ -123,6 +125,15 @@ pub struct Comment {
     pub emojis: Vec<(String, String)>,
     /// GIF or sticker posted with the comment: (URL, width / height)
     pub image: Option<(String, f32)>,
+    /// Comment engagement actions & state (populated for web/signed-in sessions).
+    pub toolbar_state_key: Option<String>,
+    pub like_action: Option<String>,
+    pub unlike_action: Option<String>,
+    pub dislike_action: Option<String>,
+    pub undislike_action: Option<String>,
+    pub reply_params: Option<String>,
+    /// 0 = neutral, 1 = liked, -1 = disliked
+    pub like_state: i8,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -132,6 +143,7 @@ pub struct CommentPage {
     pub count_text: Option<String>,
     pub sort_top_token: Option<String>,
     pub sort_new_token: Option<String>,
+    pub create_params: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]

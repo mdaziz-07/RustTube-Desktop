@@ -382,7 +382,7 @@ impl Player {
                     }
                     ("seeking", PropValue::Flag(b)) => self.seeking = b,
                     ("demuxer-cache-time", PropValue::Double(c)) => self.cache_time = c,
-                    ("speed", PropValue::Double(s)) => self.speed = s,
+                    ("speed", PropValue::Double(s)) if self.boost.is_none() => self.speed = s,
                     ("volume", PropValue::Double(v)) => self.volume = v,
                     ("mute", PropValue::Flag(m)) => self.muted = m,
                     ("dwidth", PropValue::Double(w)) => self.video_size.0 = w,
@@ -1126,15 +1126,23 @@ impl Player {
         if self.paused {
             self.set_paused(false);
         }
+        let target = self.speed.max(2.0);
         if let Some(m) = &self.mpv {
-            m.set_f64("speed", (self.speed * 2.0).clamp(2.0, 4.0));
+            if (target - self.speed).abs() > 0.001 {
+                m.set_f64("speed", target);
+            }
         }
     }
 
     pub fn end_boost(&mut self) {
         if let Some(prev) = self.boost.take() {
             if let Some(m) = &self.mpv {
-                m.set_f64("speed", prev);
+                let target = prev.max(2.0);
+                if (target - prev).abs() > 0.001 {
+                    m.set_f64("speed", prev);
+                    // Resync A-V buffers after toggling temporary 2x boost
+                    let _ = m.command(&["seek", "0", "relative+exact"]);
+                }
             }
         }
     }
@@ -1142,10 +1150,14 @@ impl Player {
     pub fn set_speed(&mut self, s: f64) {
         let s = (s * 100.0).round() / 100.0;
         let s = s.clamp(0.1, 5.0);
+        let prev = self.speed;
         self.boost = None;
         self.speed = s;
         if let Some(m) = &self.mpv {
             m.set_f64("speed", s);
+            if (s - prev).abs() >= 0.45 {
+                let _ = m.command(&["seek", "0", "relative+exact"]);
+            }
         }
         if store::settings_snapshot().remember_speed_per_channel {
             if let Some(c) = &self.channel_id {
