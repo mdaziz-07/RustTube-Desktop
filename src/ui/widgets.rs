@@ -506,6 +506,45 @@ pub fn rich_text_with(id: impl Into<ElementId>, text: String, emojis: &[(String,
     rich_text_with_links(id, text, emojis, &[], cx)
 }
 
+fn app_text_view_style(p: Pal) -> gpui_kit::base::TextViewStyle {
+    gpui_kit::base::TextViewStyle::default()
+        .with_foreground(p.text)
+        .with_muted_foreground(p.text2)
+        .with_link(p.link)
+        .with_selection(p.accent.opacity(0.35))
+        .with_code_background(p.chip)
+        .with_border(p.border)
+        .with_dark(p.dark)
+}
+
+/// Selectable plain text (drag-select + Ctrl+C + right-click "Copy"),
+/// without linkifying tokens inside titles.
+pub fn selectable_text(id: impl Into<ElementId>, text: String, bold: bool, cx: &App) -> Div {
+    let p = pal(cx);
+    let mut escaped = String::with_capacity(text.len() + 16);
+    md_escape(&text, &mut escaped);
+    let escaped = escaped.replace("\r\n", "\n").replace('\n', "  \n");
+    let mut view = gpui_kit::base::TextView::markdown(id, escaped)
+        .style(app_text_view_style(p))
+        .selectable(true)
+        .text_color(p.text);
+    if bold {
+        view = view.font_weight(FontWeight::BOLD);
+    }
+    let copy_text = text;
+    div()
+        .w_full()
+        .child(view)
+        .on_mouse_down(MouseButton::Right, move |ev: &MouseDownEvent, window, cx| {
+            cx.stop_propagation();
+            let t_copy = copy_text.clone();
+            let items = vec![crate::ui::app::MenuItem::new("copy", t("Copy"), move |_, cx| {
+                crate::ui::copy_to_clipboard(t_copy.clone(), cx);
+            })];
+            crate::ui::app::open_menu(ev.position(), items, window, cx);
+        })
+}
+
 /// [`rich_text`] with inline channel emojis and explicit `commandRuns` links.
 pub fn rich_text_with_links(
     id: impl Into<ElementId>,
@@ -539,16 +578,8 @@ pub fn rich_text_with_links(
         }
         md
     };
-    let text_style = gpui_kit::base::TextViewStyle::default()
-        .with_foreground(p.text)
-        .with_muted_foreground(p.text2)
-        .with_link(p.link)
-        .with_selection(p.accent.opacity(0.35))
-        .with_code_background(p.chip)
-        .with_border(p.border)
-        .with_dark(p.dark);
     let view = gpui_kit::base::TextView::markdown(id, md)
-        .style(text_style)
+        .style(app_text_view_style(p))
         .selectable(true)
         .on_link_click(|url, _, window, cx| open_link(url, window, cx));
     let copy_text = text.clone();

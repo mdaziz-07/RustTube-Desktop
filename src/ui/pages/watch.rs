@@ -721,7 +721,7 @@ impl WatchPage {
             .flex_col()
             .gap_3()
             .pt_3()
-            .child(div().text_xl().font_weight(FontWeight::BOLD).text_color(p.text).child(title))
+            .child(selectable_text("w-title", title, true, cx).text_xl())
             .child(
                 div()
                     .flex()
@@ -1857,50 +1857,45 @@ impl WatchPage {
                     .child(icon_button("fs-desc-close", "x", cx).on_click(|_, _, cx| set_fullscreen_desc(false, cx))),
             )
             .child(
-                nested_scroll(
-                    "fs-desc-scroll",
-                    div()
-                        .id("fs-desc-body")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.fs_desc_scroll)
-                        .p_4()
-                        .flex()
-                        .flex_col()
-                        .gap_4()
-                        .child(div().text_base().font_weight(FontWeight::BOLD).text_color(p.text).child(w.title.clone()))
-                        .child(
-                            div()
-                                .id("fs-desc-chan")
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .cursor_pointer()
-                                .on_click(move |_, window, cx| navigate(Route::Channel(cid.clone()), window, cx))
-                                .child(avatar(w.channel.avatar.as_deref(), px(36.), &w.channel.name, cx))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(w.channel.name.clone()))
-                                        .when_some(w.channel.subscribers_text.clone(), |d, t| d.child(div().text_xs().text_color(p.text2).child(t))),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .p_3()
-                                .rounded_xl()
-                                .bg(p.chip)
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .when(!meta.is_empty(), |d| d.child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(meta)))
-                                .child(div().text_sm().text_color(p.text).child(rich_text_with_links("fs-desc-text", w.description.clone(), &[], &w.description_links, cx))),
-                        ),
-                )
-                .flex_1()
-                .min_h_0(),
+                div().flex_1().min_h_0().w_full().child(
+                    page_scroll("fs-desc-scroll", &self.fs_desc_scroll).child(
+                        div()
+                            .p_4()
+                            .pb_12()
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .child(selectable_text("fs-desc-title", w.title.clone(), true, cx).text_base())
+                            .child(
+                                div()
+                                    .id("fs-desc-chan")
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .cursor_pointer()
+                                    .on_click(move |_, window, cx| navigate(Route::Channel(cid.clone()), window, cx))
+                                    .child(avatar(w.channel.avatar.as_deref(), px(36.), &w.channel.name, cx))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(w.channel.name.clone()))
+                                            .when_some(w.channel.subscribers_text.clone(), |d, t| d.child(div().text_xs().text_color(p.text2).child(t))),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .p_3()
+                                    .rounded_xl()
+                                    .bg(p.chip)
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .when(!meta.is_empty(), |d| d.child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(meta)))
+                                    .child(div().text_sm().text_color(p.text).child(rich_text_with_links("fs-desc-text", w.description.clone(), &[], &w.description_links, cx))),
+                            ),
+                    ),
+                ),
             )
             .into_any_element()
     }

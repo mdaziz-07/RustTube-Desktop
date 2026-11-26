@@ -250,6 +250,15 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
+fn hls_format_for(spec: &str) -> String {
+    match spec {
+        "audio" => "bestaudio[protocol^=m3u8]/bestaudio".to_string(),
+        "single" => "b[protocol^=m3u8]/b".to_string(),
+        "best" => "bv*[protocol^=m3u8]+ba[protocol^=m3u8]/b[protocol^=m3u8]".to_string(),
+        h => format!("bv*[protocol^=m3u8][height<={h}]+ba[protocol^=m3u8]/b[protocol^=m3u8][height<={h}]/b[protocol^=m3u8]"),
+    }
+}
+
 fn run_job(job: &Job, cancel: &AtomicBool, progress: &dyn Fn(f32, &str)) -> anyhow::Result<String> {
     let s = store::settings_snapshot();
     let dir = std::path::PathBuf::from(if s.download_dir.is_empty() { ".".into() } else { s.download_dir.clone() });
@@ -263,61 +272,97 @@ fn run_job(job: &Job, cancel: &AtomicBool, progress: &dyn Fn(f32, &str)) -> anyh
             "best" => "bv*+ba/b".to_string(),
             h => format!("bv*[height<={h}]+ba/b[height<={h}]/b"),
         };
-        let res = match ytdlp_run(&bin, &dir, &url, &fmt, &s, &[], None, cancel, progress) {
-            Err(e) if e.to_string().contains("403") && !cancel.load(Ordering::SeqCst) => {
-                // a stream URL was refused: retry preferring the HLS formats, which don't need a PO token
+        let mut res = ytdlp_run(&bin, &dir, &url, &fmt, &s, &[], None, true, cancel, progress);
+        if let Err(e) = &res {
+            if e.to_string().contains("403") && !cancel.load(Ordering::SeqCst) {
+                // a stream URL was refused: retry preferring the HLS formats (for both video & audio), which don't need a PO token
                 progress(0.0, translate("Retrying…"));
-                let hls = format!("{}/{}", fmt.replace("bv*", "bv*[protocol^=m3u8]"), fmt);
-                ytdlp_run(&bin, &dir, &url, &hls, &s, &[], None, cancel, progress)
+                let hls = format!("{}/{}", hls_format_for(&job.format), fmt);
+                res = ytdlp_run(&bin, &dir, &url, &hls, &s, &[], None, true, cancel, progress);
             }
-            other => other,
-        };
-        return match res {
-            Err(e) if retry_with_ios(&e.to_string()) && !cancel.load(Ordering::SeqCst) => {
-                // videos made for kids are refused to yt-dlp's default clients;
-                // the iOS client still serves them (its HLS formats need no PO token)
-                progress(0.0, translate("Retrying…"));
-                match ytdlp_run(&bin, &dir, &url, &fmt, &s, &["--extractor-args", YTDLP_IOS], None, cancel, progress) {
-                    Err(e2) if e2.to_string() == "cancelled" => Err(e2),
-                    Err(_) if !cancel.load(Ordering::SeqCst) => {
-                        // yt-dlp found no formats either: download the HLS manifest the
-                        // app itself plays these videos from
-                        match streams::ios_hls_manifest(&job.video.id) {
-                            Ok(manifest) => {
-                                let fmt = if job.format == "single" { "bv*+ba/b".to_string() } else { fmt.clone() };
-                                let name = format!("{} [{}]", sanitize(&job.video.title).trim_end_matches('.').replace('%', "%%"), job.video.id);
-                                ytdlp_run(&bin, &dir, &manifest, &fmt, &s, &[], Some(&name), cancel, progress)
-                                    .map_err(|e3| if e3.to_string() == "cancelled" { e3 } else { e })
-                            }
-                            Err(_) => Err(e),
-                        }
+        }
+        if let Err(e) = &res {
+            if retry_with_ios(&e.to_string()) && !cancel.load(Ordering::SeqCst) {
+                for args in [&["--extractor-args", YTDLP_IOS][..], &["--extractor-args", "youtube:player_client=android_vr"][..]] {
+                    if cancel.load(Ordering::SeqCst) {
+                        break;
                     }
-                    other => other,
+                    progress(0.0, translate("Retrying…"));
+                    res = ytdlp_run(&bin, &dir, &url, &fmt, &s, args, None, false, cancel, progress);
+                    if res.is_ok() || cancel.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+                if res.is_err() && !cancel.load(Ordering::SeqCst) {
+                    // download via the HLS manifest the app itself resolves
+                    if let Ok(manifest) = streams::ios_hls_manifest(&job.video.id) {
+                        let m_fmt = if job.format == "single" { "bv*+ba/b".to_string() } else { fmt.clone() };
+                        let name = format!("{} [{}]", sanitize(&job.video.title).trim_end_matches('.').replace('%', "%%"), job.video.id);
+                        res = ytdlp_run(&bin, &dir, &manifest, &m_fmt, &s, &[], Some(&name), false, cancel, progress);
+                    }
                 }
             }
-            other => other,
-        };
+        }
+        if res.is_ok() || cancel.load(Ordering::SeqCst) {
+            return res;
+        }
+        // Final resilient fallback: use the app's own Innertube stream resolver + ffmpeg/native download
+        if let Ok(path) = streams_download(job, &dir, cancel, progress) {
+            return Ok(path);
+        }
+        return res;
     }
-    native_download(job, &dir, cancel, progress)
+    streams_download(job, &dir, cancel, progress)
 }
 
 /// yt-dlp extractor arguments for the iOS client, including the formats yt-dlp
 /// would otherwise hold back for lack of a PO token.
 pub const YTDLP_IOS: &str = "youtube:player_client=ios;formats=missing_pot";
 
-/// Whether a failed yt-dlp run is worth retrying through the iOS client.
+/// Whether a failed yt-dlp run is worth retrying through alternate clients / Innertube streams.
 pub fn retry_with_ios(err: &str) -> bool {
     let e = err.to_lowercase();
-    !e.contains("cancelled") && (e.contains("not available") || e.contains("unavailable") || e.contains("requested format") || e.contains("reloaded"))
+    !e.contains("cancelled")
+        && (e.contains("403")
+            || e.contains("forbidden")
+            || e.contains("sign in")
+            || e.contains("not available")
+            || e.contains("unavailable")
+            || e.contains("requested format")
+            || e.contains("reloaded"))
+}
+
+struct CookieTemp(Option<std::path::PathBuf>);
+impl Drop for CookieTemp {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// `name`: the file name without extension, when the URL isn't a YouTube page
 /// (yt-dlp would otherwise name the file after the manifest).
 #[allow(clippy::too_many_arguments)]
-fn ytdlp_run(bin: &str, dir: &std::path::Path, url: &str, fmt: &str, s: &store::Settings, extra: &[&str], name: Option<&str>, cancel: &AtomicBool, progress: &dyn Fn(f32, &str)) -> anyhow::Result<String> {
+fn ytdlp_run(
+    bin: &str,
+    dir: &std::path::Path,
+    url: &str,
+    fmt: &str,
+    s: &store::Settings,
+    extra: &[&str],
+    name: Option<&str>,
+    use_cookies: bool,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(f32, &str),
+) -> anyhow::Result<String> {
     {
         let mut cmd = Command::new(bin);
         cmd.args(extra);
+        let cookies = CookieTemp(if use_cookies { crate::api::web::write_cookies_file() } else { None });
+        if let Some(cp) = &cookies.0 {
+            cmd.arg("--cookies").arg(cp);
+        }
         if let Some(p) = crate::store::proxy_setting() {
             cmd.arg("--proxy").arg(p);
         }
@@ -391,6 +436,89 @@ fn ytdlp_run(bin: &str, dir: &std::path::Path, url: &str, fmt: &str, s: &store::
         }
         Ok(if final_path.is_empty() { dir.to_string_lossy().into_owned() } else { final_path })
     }
+}
+
+/// Downloads via Stream Tube's own Innertube stream resolver (+ FFmpeg mux when separate
+/// high-resolution video & audio streams are returned), falling back to `native_download`.
+fn streams_download(job: &Job, dir: &std::path::Path, cancel: &AtomicBool, progress: &dyn Fn(f32, &str)) -> anyhow::Result<String> {
+    if job.format == "audio" || job.format == "single" {
+        return native_download(job, dir, cancel, progress);
+    }
+    let info = streams::get_streams(&job.video.id)?;
+    let target_q: u32 = match job.format.as_str() {
+        "best" => 4320,
+        h => h.parse().unwrap_or(1080),
+    };
+    let (v, a) = streams::pick_formats(&info, target_q, "h264", None);
+    let Some(ff) = ffmpeg_path() else {
+        return native_download(job, dir, cancel, progress);
+    };
+    if let (Some(v), Some(a)) = (v, a) {
+        let base = format!("{} [{}]", sanitize(&info.title).trim_end_matches('.'), job.video.id);
+        let v_tmp = dir.join(format!("{base}.video.part"));
+        let a_tmp = dir.join(format!("{base}.audio.part"));
+        let out = dir.join(format!("{base}.mp4"));
+        let cleanup = || {
+            let _ = std::fs::remove_file(&v_tmp);
+            let _ = std::fs::remove_file(&a_tmp);
+        };
+        progress(0.0, translate("Downloading…"));
+        let dl_streams = (|| -> anyhow::Result<()> {
+            let mut vf = std::fs::File::create(&v_tmp)?;
+            crate::api::http::download_to(&v.url, &mut vf, |done, total| {
+                let p = total.map(|t| (done as f32 / t as f32) * 0.85).unwrap_or(0.0);
+                progress(p, &format!("{:.1} MB", done as f64 / 1e6));
+                !cancel.load(Ordering::SeqCst)
+            })?;
+            if cancel.load(Ordering::SeqCst) {
+                anyhow::bail!("cancelled");
+            }
+            let mut af = std::fs::File::create(&a_tmp)?;
+            crate::api::http::download_to(&a.url, &mut af, |done, total| {
+                let p = 0.85 + total.map(|t| (done as f32 / t as f32) * 0.1).unwrap_or(0.0);
+                progress(p, &format!("{0}{:.1} MB", translate("Audio, "), done as f64 / 1e6));
+                !cancel.load(Ordering::SeqCst)
+            })?;
+            Ok(())
+        })();
+        if dl_streams.is_ok() && !cancel.load(Ordering::SeqCst) {
+            progress(0.97, translate("Finishing…"));
+            let mut cmd = Command::new(&ff);
+            cmd.args(["-y", "-i"])
+                .arg(&v_tmp)
+                .arg("-i")
+                .arg(&a_tmp)
+                .args(["-c", "copy", "-movflags", "+faststart"])
+                .arg(&out)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            hide_window(&mut cmd);
+            let status = cmd.status();
+            cleanup();
+            if status.map(|s| s.success()).unwrap_or(false) {
+                return Ok(out.to_string_lossy().into_owned());
+            }
+        } else {
+            cleanup();
+            if cancel.load(Ordering::SeqCst) {
+                anyhow::bail!("cancelled");
+            }
+        }
+    }
+    if let Some(hls_url) = info.hls_url.as_deref() {
+        let out = dir.join(format!("{} [{}].mp4", sanitize(&info.title).trim_end_matches('.'), job.video.id));
+        progress(0.2, translate("Downloading…"));
+        let mut cmd = Command::new(&ff);
+        cmd.args(["-y", "-i", hls_url, "-c", "copy", "-movflags", "+faststart"])
+            .arg(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        hide_window(&mut cmd);
+        if cmd.status().map(|s| s.success()).unwrap_or(false) {
+            return Ok(out.to_string_lossy().into_owned());
+        }
+    }
+    native_download(job, dir, cancel, progress)
 }
 
 /// Without yt-dlp: progressive (muxed) stream or audio-only stream.
@@ -981,15 +1109,23 @@ mod kids_download_tests {
         let url = "https://www.youtube.com/watch?v=e_04ZrNroTo";
         let fmt = "bv*[height<=360]+ba/b[height<=360]/b";
         // yt-dlp alone fails, with an error that leads to the retries
-        if let Err(e) = super::ytdlp_run(&bin, &dir, url, fmt, &s, &["--extractor-args", super::YTDLP_IOS], None, &cancel, &|_, _| {}) {
+        if let Err(e) = super::ytdlp_run(&bin, &dir, url, fmt, &s, &["--extractor-args", super::YTDLP_IOS], None, false, &cancel, &|_, _| {}) {
             println!("yt-dlp iOS: {e}");
         }
         let manifest = crate::api::streams::ios_hls_manifest("e_04ZrNroTo").unwrap();
         let name = format!("{} [e_04ZrNroTo]", super::sanitize("Kids: test / video?").replace('%', "%%"));
-        let path = super::ytdlp_run(&bin, &dir, &manifest, fmt, &s, &[], Some(&name), &cancel, &|p, d| println!("{p:.2} {d}")).unwrap();
+        let path = super::ytdlp_run(&bin, &dir, &manifest, fmt, &s, &[], Some(&name), false, &cancel, &|p, d| println!("{p:.2} {d}")).unwrap();
         println!("{path}");
         assert!(path.contains("e_04ZrNroTo"));
         assert!(std::fs::metadata(&path).unwrap().len() > 1_000_000);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[::core::prelude::v1::test]
+    fn retries_403_and_formats_hls() {
+        assert!(super::retry_with_ios("unable to download video data: HTTP Error 403: Forbidden"));
+        assert!(!super::retry_with_ios("cancelled"));
+        let f = super::hls_format_for("1080");
+        assert!(f.contains("bv*[protocol^=m3u8][height<=1080]+ba[protocol^=m3u8]"));
     }
 }
