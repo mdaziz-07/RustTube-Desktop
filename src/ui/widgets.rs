@@ -642,7 +642,7 @@ pub fn comment_body(id: impl Into<SharedString>, c: &crate::api::types::Comment,
 
 #[cfg(test)]
 mod clamp_tests {
-    use super::{clamp_text, tokenize, Token};
+    use super::{clamp_text, to_markdown_with_links, tokenize, Token};
     #[test]
     fn clamps() {
         assert_eq!(clamp_text("short", 5, 400), None);
