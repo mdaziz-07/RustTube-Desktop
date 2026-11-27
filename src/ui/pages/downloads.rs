@@ -10,7 +10,8 @@ pub struct DownloadsPage {
 }
 
 impl DownloadsPage {
-    pub fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
+    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+        crate::downloads::sync_local_files(cx);
         Self { scroll: ScrollHandle::new() }
     }
 }
@@ -33,7 +34,41 @@ impl Render for DownloadsPage {
                 JobStatus::Cancelled => (t("Cancelled").into(), p.text3),
             };
             let done_path = if let JobStatus::Done(path) = &j.status { Some(path.clone()) } else { None };
+            let click_path = done_path.clone();
             let running = matches!(j.status, JobStatus::Running | JobStatus::Queued);
+            let sub_meta = if let Some(sz) = done_path.as_deref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len()) {
+                let sz_str = if sz >= 1_000_000_000 {
+                    format!("{:.2} GB", sz as f64 / 1e9)
+                } else {
+                    format!("{:.1} MB", sz as f64 / 1e6)
+                };
+                if j.video.channel_name.is_empty() {
+                    format!("{sz_str}, format {}", j.format)
+                } else {
+                    format!("{}, format {} • {sz_str}", j.video.channel_name, j.format)
+                }
+            } else if j.video.channel_name.is_empty() {
+                tf!("format {0}", j.format).into()
+            } else {
+                tf!("{0}, format {1}", j.video.channel_name, j.format).into()
+            };
+            let thumb_el: AnyElement = match crate::downloads::local_thumb_path(&j.video.id) {
+                Some(local) => img(local)
+                    .w(px(160.))
+                    .h(px(90.))
+                    .rounded_lg()
+                    .object_fit(ObjectFit::Cover)
+                    .with_fallback(move || div().size_full().rounded_lg().bg(p.chip).flex().items_center().justify_center().child(icon("film").size_6().text_color(p.text3)).into_any_element())
+                    .into_any_element(),
+                None if !j.video.thumbnail.is_empty() => img(SharedString::from(j.video.thumbnail.clone()))
+                    .w(px(160.))
+                    .h(px(90.))
+                    .rounded_lg()
+                    .object_fit(ObjectFit::Cover)
+                    .with_fallback(move || div().size_full().rounded_lg().bg(p.chip).flex().items_center().justify_center().child(icon("film").size_6().text_color(p.text3)).into_any_element())
+                    .into_any_element(),
+                None => div().w(px(160.)).h(px(90.)).rounded_lg().bg(p.chip).flex().items_center().justify_center().child(icon("film").size_6().text_color(p.text3)).into_any_element(),
+            };
             list = list.child(
                 div()
                     .flex()
@@ -46,8 +81,14 @@ impl Render for DownloadsPage {
                         div()
                             .id(SharedString::from(format!("dlt-{id}")))
                             .cursor_pointer()
-                            .on_click(move |_, window, cx| navigate(Route::Watch { id: vid.clone(), playlist: None, start: None }, window, cx))
-                            .child(img(SharedString::from(j.video.thumbnail.clone())).w(px(160.)).h(px(90.)).rounded_lg().object_fit(ObjectFit::Cover)),
+                            .on_click(move |_, window, cx| {
+                                if let Some(path) = click_path.as_deref().filter(|p| std::path::Path::new(p).exists()) {
+                                    crate::downloads::open_file(path, cx);
+                                } else if !vid.is_empty() {
+                                    navigate(Route::Watch { id: vid.clone(), playlist: None, start: None }, window, cx);
+                                }
+                            })
+                            .child(thumb_el),
                     )
                     .child(
                         div()
@@ -57,7 +98,7 @@ impl Render for DownloadsPage {
                             .min_w_0()
                             .gap_2()
                             .child(div().text_base().font_weight(FontWeight::SEMIBOLD).text_color(p.text).truncate().child(j.video.title.clone()))
-                            .child(div().text_xs().text_color(p.text2).child(tf!("{0}, format {1}", j.video.channel_name, j.format)))
+                            .child(div().text_xs().text_color(p.text2).child(sub_meta))
                             .when(running, |d| {
                                 d.child(div().w_full().h(px(4.)).rounded_full().bg(p.hover).child(div().h_full().rounded_full().w(relative(j.progress.clamp(0.0, 1.0))).bg(p.accent)))
                             })

@@ -1690,7 +1690,15 @@ impl AppView {
             let title = if j.video.title.is_empty() { j.video.id.clone() } else { j.video.title.clone() };
             let (line, color, running) = match &j.status {
                 JobStatus::Queued => (t("Waiting…").to_string(), p.text2, true),
-                JobStatus::Running => (format!("{:.0}%{}", j.progress * 100.0, j.detail.split("at").nth(1).map(|s| format!(", {}", s.trim())).unwrap_or_default()), p.text2, true),
+                JobStatus::Running => (
+                    if j.detail.is_empty() {
+                        format!("{:.0}%", j.progress * 100.0)
+                    } else {
+                        j.detail.clone()
+                    },
+                    p.text2,
+                    true,
+                ),
                 JobStatus::Done(path) => (
                     std::fs::metadata(path).map(|m| tf!("{0} MB, {1}", format_args!("{:.1}", m.len() as f64 / 1e6), j.format)).unwrap_or_else(|_| t("File missing").into()),
                     p.text2,
@@ -1701,6 +1709,19 @@ impl AppView {
             };
             let done_path = if let JobStatus::Done(pth) = &j.status { Some(pth.clone()) } else { None };
             let open_path = done_path.clone();
+            let pop_thumb: AnyElement = match downloads::local_thumb_path(&j.video.id) {
+                Some(local) => img(local)
+                    .size_full()
+                    .object_fit(ObjectFit::Cover)
+                    .with_fallback(move || div().size_full().flex().items_center().justify_center().child(icon("film").size_4().text_color(p.text3)).into_any_element())
+                    .into_any_element(),
+                None if !j.video.thumbnail.is_empty() => img(j.video.thumbnail.clone())
+                    .size_full()
+                    .object_fit(ObjectFit::Cover)
+                    .with_fallback(move || div().size_full().flex().items_center().justify_center().child(icon("film").size_4().text_color(p.text3)).into_any_element())
+                    .into_any_element(),
+                None => div().size_full().flex().items_center().justify_center().child(icon("film").size_4().text_color(p.text3)).into_any_element(),
+            };
             let mut row = div()
                 .id(SharedString::from(format!("dlp-{id}")))
                 .flex()
@@ -1725,7 +1746,7 @@ impl AppView {
                         .rounded_md()
                         .overflow_hidden()
                         .bg(p.chip)
-                        .child(img(j.video.thumbnail.clone()).size_full().object_fit(ObjectFit::Cover)),
+                        .child(pop_thumb),
                 )
                 .child(
                     div()

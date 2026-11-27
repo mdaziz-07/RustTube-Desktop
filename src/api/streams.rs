@@ -9,6 +9,7 @@ use std::process::Command;
 
 const VR_VERSION: &str = "1.65.10";
 const VR_UA: &str = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+pub const DIRECT_UA: &str = VR_UA;
 
 /// Resolves playable streams for a video (cached for a few hours).
 ///
@@ -28,6 +29,21 @@ pub fn get_streams(video_id: &str) -> Result<StreamInfo> {
     let info = resolve(video_id)?;
     cache_put(video_id, &info);
     Ok(info)
+}
+
+/// Resolves direct byte-range streams (~200 ms via ANDROID_VR) for high-speed
+/// parallel chunk downloading; falls back to `get_streams`.
+pub fn direct_streams(video_id: &str) -> Result<StreamInfo> {
+    if let Some(info) = cache_get(video_id).filter(|i| !i.hls_only && (!i.video.is_empty() || !i.muxed.is_empty())) {
+        return Ok(info);
+    }
+    if let Ok(info) = android_vr(video_id) {
+        if !info.video.is_empty() || !info.muxed.is_empty() {
+            cache_put(video_id, &info);
+            return Ok(info);
+        }
+    }
+    get_streams(video_id)
 }
 
 /// Starts resolving streams in the background (e.g. when hovering a thumbnail).

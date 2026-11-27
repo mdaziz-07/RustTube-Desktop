@@ -29,6 +29,7 @@ pub struct Job {
     pub progress: f32,
     pub detail: String,
     pub cancel: Arc<AtomicBool>,
+    pub child_pid: Arc<AtomicU32>,
 }
 
 #[derive(Default)]
@@ -106,31 +107,8 @@ pub fn start(video: VideoItem, format: Option<String>, cx: &mut App) {
         return;
     }
     let fmt = format.unwrap_or_else(|| store::settings_snapshot().download_format.clone());
-    // without yt-dlp only 360p (one combined stream) or audio can be saved
-    if fmt != "audio" && fmt != "single" && streams::ytdlp_path().is_none() {
-        if YTDLP_FETCHING.load(Ordering::SeqCst) {
-            PENDING.lock().push((video, Some(fmt)));
-            return;
-        }
-        let v2 = video.clone();
-        crate::ui::toast_with_actions(
-            cx,
-            translate("Higher quality downloads use yt-dlp"),
-            vec![
-                (
-                    tf!("Get yt-dlp ({0})", YTDLP_SIZE).into(),
-                    Arc::new(move |_, cx: &mut App| {
-                        PENDING.lock().push((video.clone(), Some(fmt.clone())));
-                        fetch_ytdlp(cx);
-                    }),
-                ),
-                (translate("Download 360p").into(), Arc::new(move |_, cx: &mut App| start(v2.clone(), Some("single".into()), cx))),
-            ],
-        );
-        return;
-    }
-    // separate video + audio streams need FFmpeg to be joined into one file
-    if fmt != "audio" && fmt != "single" && streams::ytdlp_path().is_some() && ffmpeg_path().is_none() {
+    // separate video + audio streams above 360p need FFmpeg to mux cleanly
+    if fmt != "audio" && fmt != "single" && ffmpeg_path().is_none() {
         if FFMPEG_FETCHING.load(Ordering::SeqCst) {
             // queued behind the FFmpeg download
             PENDING.lock().push((video, Some(fmt)));
@@ -153,6 +131,7 @@ pub fn start(video: VideoItem, format: Option<String>, cx: &mut App) {
         );
         return;
     }
+    cache_thumb_bg(&video.id, &video.thumbnail);
     let d = cx.default_global::<Downloads>();
     d.next += 1;
     let job = Job {
@@ -163,12 +142,14 @@ pub fn start(video: VideoItem, format: Option<String>, cx: &mut App) {
         progress: 0.0,
         detail: String::new(),
         cancel: Arc::new(AtomicBool::new(false)),
+        child_pid: Arc::new(AtomicU32::new(0)),
     };
     let jobs = d.jobs.clone();
     jobs.lock().push(job.clone());
     toast(cx, tf!("Downloading “{0}”", video.title));
     let jid = job.id;
     let cancel = job.cancel.clone();
+    let child_pid = job.child_pid.clone();
     let jobs2 = jobs.clone();
     std::thread::spawn(move || {
         let update = |f: &dyn Fn(&mut Job)| {
@@ -179,31 +160,53 @@ pub fn start(video: VideoItem, format: Option<String>, cx: &mut App) {
         // at most 3 downloads at a time; the rest wait their turn
         loop {
             if cancel.load(Ordering::SeqCst) {
-                update(&|j| j.status = JobStatus::Cancelled);
+                update(&|j| {
+                    j.status = JobStatus::Cancelled;
+                    j.detail = translate("Cancelled").to_string();
+                });
                 return;
             }
             let running = jobs2.lock().iter().filter(|j| j.status == JobStatus::Running).count();
             if running < 3 {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(400));
+            std::thread::sleep(std::time::Duration::from_millis(120));
         }
-        update(&|j| j.status = JobStatus::Running);
-        let res = run_job(&job, &cancel, &|p, detail| {
-            update(&|j| {
-                j.progress = p;
-                j.detail = detail.to_string();
-            })
-        })
+        update(&|j| {
+            if !cancel.load(Ordering::SeqCst) {
+                j.status = JobStatus::Running;
+            }
+        });
+        let res = {
+            let jobs_prog = jobs2.clone();
+            let cancel_prog = cancel.clone();
+            let report_progress = move |p: f32, detail: &str| {
+                if let Some(j) = jobs_prog.lock().iter_mut().find(|j| j.id == jid) {
+                    if matches!(j.status, JobStatus::Running | JobStatus::Queued) && !cancel_prog.load(Ordering::SeqCst) {
+                        j.progress = p;
+                        j.detail = detail.to_string();
+                    }
+                }
+            };
+            run_job(&job, &cancel, &child_pid, &report_progress)
+        }
         .map(|path| resolve_output(&path, &job.video.id).unwrap_or(path));
         match res {
-            Ok(path) => update(&|j| {
+            Ok(path) if !cancel.load(Ordering::SeqCst) => update(&|j| {
                 j.status = JobStatus::Done(path.clone());
                 j.progress = 1.0;
+                j.detail.clear();
+            }),
+            Ok(_) => update(&|j| {
+                j.status = JobStatus::Cancelled;
+                j.detail = translate("Cancelled").to_string();
             }),
             Err(e) if cancel.load(Ordering::SeqCst) => {
                 let _ = e;
-                update(&|j| j.status = JobStatus::Cancelled)
+                update(&|j| {
+                    j.status = JobStatus::Cancelled;
+                    j.detail = translate("Cancelled").to_string();
+                });
             }
             Err(e) => update(&|j| j.status = JobStatus::Failed(e.to_string())),
         }
@@ -217,21 +220,28 @@ fn ensure_ticking(cx: &mut App) {
     }
     cx.default_global::<Downloads>().ticking = true;
     cx.spawn(async move |cx| {
+        let mut last_done_sig = (0usize, 0usize);
         loop {
-            cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
-            let active = cx
-                .update(|cx| {
-                    cx.refresh_windows();
-                    let d = cx.default_global::<Downloads>();
-                    let active = d.jobs.lock().iter().any(|j| matches!(j.status, JobStatus::Queued | JobStatus::Running));
-                    if !active {
-                        d.ticking = false;
-                    }
-                    if !active {
-                        save_history(cx);
-                    }
-                    active
-                });
+            cx.background_executor().timer(std::time::Duration::from_millis(150)).await;
+            let active = cx.update(|cx| {
+                cx.refresh_windows();
+                let d = cx.default_global::<Downloads>();
+                let (active, done_cnt, fail_cnt) = {
+                    let jobs = d.jobs.lock();
+                    let active = jobs.iter().any(|j| matches!(j.status, JobStatus::Queued | JobStatus::Running));
+                    let done_cnt = jobs.iter().filter(|j| matches!(j.status, JobStatus::Done(_))).count();
+                    let fail_cnt = jobs.iter().filter(|j| matches!(j.status, JobStatus::Failed(_))).count();
+                    (active, done_cnt, fail_cnt)
+                };
+                if !active {
+                    d.ticking = false;
+                }
+                if !active || (done_cnt, fail_cnt) != last_done_sig {
+                    last_done_sig = (done_cnt, fail_cnt);
+                    save_history(cx);
+                }
+                active
+            });
             if !active {
                 break;
             }
@@ -259,60 +269,148 @@ fn hls_format_for(spec: &str) -> String {
     }
 }
 
-fn run_job(job: &Job, cancel: &AtomicBool, progress: &dyn Fn(f32, &str)) -> anyhow::Result<String> {
+fn format_bytes(b: u64) -> String {
+    if b >= 1_000_000_000 {
+        format!("{:.2} GB", b as f64 / 1e9)
+    } else if b >= 1_000_000 {
+        format!("{:.1} MB", b as f64 / 1e6)
+    } else if b >= 1_000 {
+        format!("{:.0} KB", b as f64 / 1e3)
+    } else {
+        format!("{b} B")
+    }
+}
+
+fn format_speed(bps: f64) -> String {
+    if bps >= 1_000_000.0 {
+        format!("{:.1} MB/s", bps / 1e6)
+    } else if bps >= 1_000.0 {
+        format!("{:.0} KB/s", bps / 1e3)
+    } else {
+        format!("{:.0} B/s", bps.max(0.0))
+    }
+}
+
+fn format_eta(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    if s >= 3600 {
+        format!("{}h {}m left", s / 3600, (s % 3600) / 60)
+    } else if s >= 60 {
+        format!("{}m {}s left", s / 60, s % 60)
+    } else {
+        format!("{s}s left")
+    }
+}
+
+fn format_dl_progress(done: u64, total: Option<u64>, bps: f64) -> (f32, String) {
+    let speed = if bps > 512.0 { format!(" • {}", format_speed(bps)) } else { String::new() };
+    match total.filter(|&t| t > 0) {
+        Some(t) => {
+            let pct = (done as f32 / t as f32).clamp(0.0, 0.99);
+            let eta = if bps > 1024.0 && t > done {
+                format!(" • {}", format_eta((t - done) as f64 / bps))
+            } else {
+                String::new()
+            };
+            let msg = format!("{:.0}% • {} / {}{}{}", pct * 100.0, format_bytes(done), format_bytes(t), speed, eta);
+            (pct, msg)
+        }
+        None => (0.0, format!("{}{}", format_bytes(done), speed)),
+    }
+}
+
+fn kill_process_tree(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    std::thread::spawn(move || {
+        #[cfg(windows)]
+        {
+            let mut c = Command::new("taskkill");
+            c.args(["/F", "/T", "/PID", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null());
+            hide_window(&mut c);
+            let _ = c.status();
+        }
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        }
+    });
+}
+
+fn run_and_poll(mut cmd: Command, child_pid: &AtomicU32, cancel: &AtomicBool) -> anyhow::Result<bool> {
+    hide_window(&mut cmd);
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    child_pid.store(pid, Ordering::SeqCst);
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            child_pid.store(0, Ordering::SeqCst);
+            let _ = child.kill();
+            kill_process_tree(pid);
+            let _ = child.wait();
+            anyhow::bail!("cancelled");
+        }
+        if let Some(st) = child.try_wait()? {
+            child_pid.store(0, Ordering::SeqCst);
+            return Ok(st.success());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(80));
+    }
+}
+
+fn run_job(job: &Job, cancel: &AtomicBool, child_pid: &AtomicU32, progress: &(dyn Fn(f32, &str) + Send + Sync)) -> anyhow::Result<String> {
     let s = store::settings_snapshot();
     let dir = std::path::PathBuf::from(if s.download_dir.is_empty() { ".".into() } else { s.download_dir.clone() });
     std::fs::create_dir_all(&dir)?;
-    let url = format!("https://www.youtube.com/watch?v={}", job.video.id);
-    if let Some(bin) = streams::ytdlp_path() {
-        let fmt = match job.format.as_str() {
-            "audio" => "bestaudio[ext=m4a]/bestaudio".to_string(),
-            // one file with video and audio (no FFmpeg needed)
-            "single" => "b".to_string(),
-            "best" => "bv*+ba/b".to_string(),
-            h => format!("bv*[height<={h}]+ba/b[height<={h}]/b"),
-        };
-        let mut res = ytdlp_run(&bin, &dir, &url, &fmt, &s, &[], None, true, cancel, progress);
-        if let Err(e) = &res {
-            if e.to_string().contains("403") && !cancel.load(Ordering::SeqCst) {
-                // a stream URL was refused: retry preferring the HLS formats (for both video & audio), which don't need a PO token
-                progress(0.0, translate("Retrying…"));
-                let hls = format!("{}/{}", hls_format_for(&job.format), fmt);
-                res = ytdlp_run(&bin, &dir, &url, &hls, &s, &[], None, true, cancel, progress);
-            }
-        }
-        if let Err(e) = &res {
-            if retry_with_ios(&e.to_string()) && !cancel.load(Ordering::SeqCst) {
-                for args in [&["--extractor-args", YTDLP_IOS][..], &["--extractor-args", "youtube:player_client=android_vr"][..]] {
-                    if cancel.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    progress(0.0, translate("Retrying…"));
-                    res = ytdlp_run(&bin, &dir, &url, &fmt, &s, args, None, false, cancel, progress);
-                    if res.is_ok() || cancel.load(Ordering::SeqCst) {
-                        break;
+
+    // Fast path: resolve direct Innertube streams (~200 ms) and download with 8 parallel Range chunks.
+    match streams_download(job, &dir, cancel, child_pid, progress) {
+        Ok(path) => return Ok(path),
+        Err(e) if cancel.load(Ordering::SeqCst) || e.to_string() == "cancelled" => return Err(anyhow::anyhow!("cancelled")),
+        Err(direct_err) => {
+            if let Some(bin) = streams::ytdlp_path() {
+                let url = format!("https://www.youtube.com/watch?v={}", job.video.id);
+                let fmt = match job.format.as_str() {
+                    "audio" => "bestaudio[ext=m4a]/bestaudio".to_string(),
+                    "single" => "b".to_string(),
+                    "best" => "bv*+ba/b".to_string(),
+                    h => format!("bv*[height<={h}]+ba/b[height<={h}]/b"),
+                };
+                let mut res = ytdlp_run(&bin, &dir, &url, &fmt, &s, &[], None, true, cancel, child_pid, progress);
+                if let Err(e) = &res {
+                    if e.to_string().contains("403") && !cancel.load(Ordering::SeqCst) {
+                        progress(0.0, translate("Retrying…"));
+                        let hls = format!("{}/{}", hls_format_for(&job.format), fmt);
+                        res = ytdlp_run(&bin, &dir, &url, &hls, &s, &[], None, true, cancel, child_pid, progress);
                     }
                 }
-                if res.is_err() && !cancel.load(Ordering::SeqCst) {
-                    // download via the HLS manifest the app itself resolves
-                    if let Ok(manifest) = streams::ios_hls_manifest(&job.video.id) {
-                        let m_fmt = if job.format == "single" { "bv*+ba/b".to_string() } else { fmt.clone() };
-                        let name = format!("{} [{}]", sanitize(&job.video.title).trim_end_matches('.').replace('%', "%%"), job.video.id);
-                        res = ytdlp_run(&bin, &dir, &manifest, &m_fmt, &s, &[], Some(&name), false, cancel, progress);
+                if let Err(e) = &res {
+                    if retry_with_ios(&e.to_string()) && !cancel.load(Ordering::SeqCst) {
+                        for args in [&["--extractor-args", YTDLP_IOS][..], &["--extractor-args", "youtube:player_client=android_vr"][..]] {
+                            if cancel.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            progress(0.0, translate("Retrying…"));
+                            res = ytdlp_run(&bin, &dir, &url, &fmt, &s, args, None, false, cancel, child_pid, progress);
+                            if res.is_ok() || cancel.load(Ordering::SeqCst) {
+                                break;
+                            }
+                        }
+                        if res.is_err() && !cancel.load(Ordering::SeqCst) {
+                            if let Ok(manifest) = streams::ios_hls_manifest(&job.video.id) {
+                                let m_fmt = if job.format == "single" { "bv*+ba/b".to_string() } else { fmt.clone() };
+                                let name = format!("{} [{}]", sanitize(&job.video.title).trim_end_matches('.').replace('%', "%%"), job.video.id);
+                                res = ytdlp_run(&bin, &dir, &manifest, &m_fmt, &s, &[], Some(&name), false, cancel, child_pid, progress);
+                            }
+                        }
                     }
                 }
+                return res;
             }
+            Err(direct_err)
         }
-        if res.is_ok() || cancel.load(Ordering::SeqCst) {
-            return res;
-        }
-        // Final resilient fallback: use the app's own Innertube stream resolver + ffmpeg/native download
-        if let Ok(path) = streams_download(job, &dir, cancel, progress) {
-            return Ok(path);
-        }
-        return res;
     }
-    streams_download(job, &dir, cancel, progress)
 }
 
 /// yt-dlp extractor arguments for the iOS client, including the formats yt-dlp
@@ -354,7 +452,8 @@ fn ytdlp_run(
     name: Option<&str>,
     use_cookies: bool,
     cancel: &AtomicBool,
-    progress: &dyn Fn(f32, &str),
+    child_pid: &AtomicU32,
+    progress: &(dyn Fn(f32, &str) + Send + Sync),
 ) -> anyhow::Result<String> {
     {
         let mut cmd = Command::new(bin);
@@ -375,9 +474,9 @@ fn ytdlp_run(
         }
         // --print makes yt-dlp quiet, so progress is asked for explicitly in a fixed format.
         // Fragments and chunks download in parallel, which is much faster than one stream.
-        cmd.args(["--newline", "--no-warnings", "--no-playlist", "--progress", "--progress-delta", "0.4"])
-            .args(["--progress-template", "download:[dl] %(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s"])
-            .args(["-N", "8", "--http-chunk-size", "10M", "-f", fmt, "-o"])
+        cmd.args(["--newline", "--no-warnings", "--no-playlist", "--progress", "--progress-delta", "0.2"])
+            .args(["--progress-template", "download:[dl] %(progress._percent_str)s|%(progress._downloaded_bytes_str)s|%(progress._total_bytes_estimate_str)s|%(progress._speed_str)s|%(progress._eta_str)s"])
+            .args(["-N", "8", "--http-chunk-size", "2M", "-f", fmt, "-o"])
             .arg(match name {
                 Some(n) => dir.join(format!("{n}.%(ext)s")),
                 None => dir.join("%(title).150B [%(id)s].%(ext)s"),
@@ -391,42 +490,88 @@ fn ytdlp_run(
         }
         hide_window(&mut cmd);
         let mut child = cmd.spawn()?;
-        progress(0.0, translate("Getting video info…"));
+        let pid = child.id();
+        child_pid.store(pid, Ordering::SeqCst);
+        progress(0.0, translate("Starting download…"));
         let stdout = child.stdout.take().unwrap();
-        // drain stderr on its own thread so a chatty yt-dlp can't block on a full pipe
         let stderr = child.stderr.take().unwrap();
         let err_reader = std::thread::spawn(move || {
             let mut s = String::new();
             let _ = std::io::Read::read_to_string(&mut BufReader::new(stderr), &mut s);
             s
         });
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let out_reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
         let mut final_path = String::new();
         // video and audio arrive one after the other: weight them 90 / 10
         let (mut phase, mut last_pct) = (0u32, 0.0f32);
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        loop {
             if cancel.load(Ordering::SeqCst) {
+                child_pid.store(0, Ordering::SeqCst);
                 let _ = child.kill();
+                kill_process_tree(pid);
+                let _ = child.wait();
                 anyhow::bail!("cancelled");
             }
-            if let Some(rest) = line.strip_prefix("[dl]") {
-                let mut parts = rest.trim().split('|');
-                let pct = parts.next().and_then(|p| p.trim().trim_end_matches('%').parse::<f32>().ok()).unwrap_or(0.0);
-                let speed = parts.next().unwrap_or("").trim();
-                let eta = parts.next().unwrap_or("").trim();
-                if pct + 20.0 < last_pct {
-                    phase += 1;
+            match rx.recv_timeout(std::time::Duration::from_millis(80)) {
+                Ok(line) => {
+                    if let Some(rest) = line.strip_prefix("[dl]") {
+                        let mut parts = rest.trim().split('|');
+                        let pct = parts.next().and_then(|p| p.trim().trim_end_matches('%').parse::<f32>().ok()).unwrap_or(0.0);
+                        let done_s = parts.next().unwrap_or("").trim();
+                        let tot_s = parts.next().unwrap_or("").trim();
+                        let speed = parts.next().unwrap_or("").trim();
+                        let eta = parts.next().unwrap_or("").trim();
+                        if pct + 20.0 < last_pct {
+                            phase += 1;
+                        }
+                        last_pct = pct;
+                        let overall = if phase == 0 { pct / 100.0 * 0.9 } else { 0.9 + pct / 100.0 * 0.1 };
+                        let what = if phase == 0 { "" } else { translate("Audio: ") };
+                        let size_part = if !tot_s.is_empty() && tot_s != "N/A" {
+                            format!("{done_s} / {tot_s}")
+                        } else if !done_s.is_empty() && done_s != "N/A" {
+                            done_s.to_string()
+                        } else {
+                            String::new()
+                        };
+                        let detail = if pct >= 100.0 && phase > 0 {
+                            translate("Finishing…").to_string()
+                        } else {
+                            let mut d = format!("{what}{:.0}%", overall * 100.0);
+                            if !size_part.is_empty() {
+                                d.push_str(&format!(" • {size_part}"));
+                            }
+                            if !speed.is_empty() && speed != "N/A" {
+                                d.push_str(&format!(" • {speed}"));
+                            }
+                            if !eta.is_empty() && eta != "N/A" {
+                                d.push_str(&format!(" • {eta} left"));
+                            }
+                            d
+                        };
+                        progress(overall.min(0.99), &detail);
+                    } else if !line.starts_with('[') && !line.trim().is_empty() {
+                        final_path = line.trim().to_string();
+                    }
                 }
-                last_pct = pct;
-                let overall = if phase == 0 { pct / 100.0 * 0.9 } else { 0.9 + pct / 100.0 * 0.1 };
-                let what = if phase == 0 { "" } else { translate("Audio, ") };
-                let detail = if pct >= 100.0 { translate("Finishing…").to_string() } else { tf!("{0}{1}%, {2}, {3} left", what, format_args!("{:.0}", pct), speed, eta) };
-                progress(overall.min(0.99), &detail);
-            } else if !line.starts_with('[') && !line.trim().is_empty() {
-                final_path = line.trim().to_string();
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         let status = child.wait()?;
+        child_pid.store(0, Ordering::SeqCst);
+        let _ = out_reader.join();
         let err = err_reader.join().unwrap_or_default();
+        if cancel.load(Ordering::SeqCst) {
+            anyhow::bail!("cancelled");
+        }
         if !status.success() {
             let last = err.lines().rev().find(|l| l.contains("ERROR")).or(err.lines().last()).unwrap_or("yt-dlp failed").to_string();
             if last.contains("confirm you") && last.contains("bot") {
@@ -438,20 +583,70 @@ fn ytdlp_run(
     }
 }
 
-/// Downloads via Stream Tube's own Innertube stream resolver (+ FFmpeg mux when separate
-/// high-resolution video & audio streams are returned), falling back to `native_download`.
-fn streams_download(job: &Job, dir: &std::path::Path, cancel: &AtomicBool, progress: &dyn Fn(f32, &str)) -> anyhow::Result<String> {
-    if job.format == "audio" || job.format == "single" {
-        return native_download(job, dir, cancel, progress);
+struct PartProgress {
+    base_done: u64,
+    grand_total: Option<u64>,
+    state: Mutex<(std::time::Instant, u64, f64, std::time::Instant)>,
+}
+
+impl PartProgress {
+    fn new(grand_total: Option<u64>) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            base_done: 0,
+            grand_total,
+            state: Mutex::new((now, 0, 0.0, now - std::time::Duration::from_secs(1))),
+        }
     }
-    let info = streams::get_streams(&job.video.id)?;
+
+    fn report(&self, current_stream_done: u64, stream_total: Option<u64>, progress: &(dyn Fn(f32, &str) + Send + Sync)) {
+        let done = self.base_done + current_stream_done;
+        let total = self.grand_total.or_else(|| stream_total.map(|t| self.base_done + t));
+        let mut st = self.state.lock();
+        let dt_last = st.3.elapsed().as_secs_f64();
+        let dt_win = st.0.elapsed().as_secs_f64();
+        if dt_win >= 0.4 {
+            let inst = done.saturating_sub(st.1) as f64 / dt_win;
+            st.2 = if st.2 <= 0.0 { inst } else { st.2 * 0.6 + inst * 0.4 };
+            st.0 = std::time::Instant::now();
+            st.1 = done;
+        }
+        if dt_last >= 0.12 || (done > 0 && st.1 == 0) {
+            st.3 = std::time::Instant::now();
+            let bps = st.2;
+            drop(st);
+            let (pct, detail) = format_dl_progress(done, total, bps);
+            progress(pct, &detail);
+        }
+    }
+}
+
+/// Downloads via Stream Tube's own fast Innertube resolver + 8-connection Range chunked transfer
+/// (+ FFmpeg remux when separate high-resolution video & audio streams are returned).
+fn streams_download(
+    job: &Job,
+    dir: &std::path::Path,
+    cancel: &AtomicBool,
+    child_pid: &AtomicU32,
+    progress: &(dyn Fn(f32, &str) + Send + Sync),
+) -> anyhow::Result<String> {
+    progress(0.0, translate("Connecting…"));
+    let info = streams::direct_streams(&job.video.id)?;
+    let headers: &[(&str, &str)] = if info.source == "innertube" {
+        &[("User-Agent", streams::DIRECT_UA)]
+    } else {
+        &[]
+    };
+    if job.format == "audio" || job.format == "single" {
+        return native_download_info(job, &info, dir, headers, cancel, progress);
+    }
     let target_q: u32 = match job.format.as_str() {
         "best" => 4320,
         h => h.parse().unwrap_or(1080),
     };
     let (v, a) = streams::pick_formats(&info, target_q, "h264", None);
     let Some(ff) = ffmpeg_path() else {
-        return native_download(job, dir, cancel, progress);
+        return native_download_info(job, &info, dir, headers, cancel, progress);
     };
     if let (Some(v), Some(a)) = (v, a) {
         let base = format!("{} [{}]", sanitize(&info.title).trim_end_matches('.'), job.video.id);
@@ -462,89 +657,123 @@ fn streams_download(job: &Job, dir: &std::path::Path, cancel: &AtomicBool, progr
             let _ = std::fs::remove_file(&v_tmp);
             let _ = std::fs::remove_file(&a_tmp);
         };
-        progress(0.0, translate("Downloading…"));
-        let dl_streams = (|| -> anyhow::Result<()> {
-            let mut vf = std::fs::File::create(&v_tmp)?;
-            crate::api::http::download_to(&v.url, &mut vf, |done, total| {
-                let p = total.map(|t| (done as f32 / t as f32) * 0.85).unwrap_or(0.0);
-                progress(p, &format!("{:.1} MB", done as f64 / 1e6));
-                !cancel.load(Ordering::SeqCst)
-            })?;
-            if cancel.load(Ordering::SeqCst) {
-                anyhow::bail!("cancelled");
-            }
-            let mut af = std::fs::File::create(&a_tmp)?;
-            crate::api::http::download_to(&a.url, &mut af, |done, total| {
-                let p = 0.85 + total.map(|t| (done as f32 / t as f32) * 0.1).unwrap_or(0.0);
-                progress(p, &format!("{}{:.1} MB", translate("Audio, "), done as f64 / 1e6));
-                !cancel.load(Ordering::SeqCst)
-            })?;
-            Ok(())
-        })();
-        if dl_streams.is_ok() && !cancel.load(Ordering::SeqCst) {
-            progress(0.97, translate("Finishing…"));
-            let mut cmd = Command::new(&ff);
-            cmd.args(["-y", "-i"])
-                .arg(&v_tmp)
-                .arg("-i")
-                .arg(&a_tmp)
-                .args(["-c", "copy", "-movflags", "+faststart"])
-                .arg(&out)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            hide_window(&mut cmd);
-            let status = cmd.status();
-            cleanup();
-            if status.map(|s| s.success()).unwrap_or(false) {
-                return Ok(out.to_string_lossy().into_owned());
-            }
-        } else {
-            cleanup();
-            if cancel.load(Ordering::SeqCst) {
-                anyhow::bail!("cancelled");
-            }
+        let grand_total = v.content_length.and_then(|vl| a.content_length.map(|al| vl + al));
+        let mut tracker = PartProgress::new(grand_total);
+        if let Some(gt) = grand_total {
+            progress(0.0, &format!("0% • 0 B / {}", format_bytes(gt)));
         }
+        let v_actual = crate::api::http::download_chunked_to(&v.url, &v_tmp, v.content_length, headers, cancel, |done, tot| {
+            tracker.report(done, tot, progress);
+        });
+        let v_bytes = match v_actual {
+            Ok(n) => n,
+            Err(e) => {
+                cleanup();
+                return Err(e);
+            }
+        };
+        if cancel.load(Ordering::SeqCst) {
+            cleanup();
+            anyhow::bail!("cancelled");
+        }
+        tracker.base_done = v_bytes;
+        tracker.grand_total = a.content_length.map(|al| v_bytes + al);
+        if let Err(e) = crate::api::http::download_chunked_to(&a.url, &a_tmp, a.content_length, headers, cancel, |done, tot| {
+            tracker.report(done, tot, progress);
+        }) {
+            cleanup();
+            return Err(e);
+        }
+        if cancel.load(Ordering::SeqCst) {
+            cleanup();
+            anyhow::bail!("cancelled");
+        }
+        progress(0.99, translate("Finishing…"));
+        let mut cmd = Command::new(&ff);
+        cmd.args(["-y", "-i"])
+            .arg(&v_tmp)
+            .arg("-i")
+            .arg(&a_tmp)
+            .args(["-c", "copy", "-movflags", "+faststart"])
+            .arg(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let ok = run_and_poll(cmd, child_pid, cancel).inspect_err(|_| {
+            cleanup();
+            let _ = std::fs::remove_file(&out);
+        })?;
+        cleanup();
+        if ok {
+            return Ok(out.to_string_lossy().into_owned());
+        }
+        let _ = std::fs::remove_file(&out);
+        anyhow::bail!("FFmpeg failed to merge video and audio");
     }
     if let Some(hls_url) = info.hls_url.as_deref() {
         let out = dir.join(format!("{} [{}].mp4", sanitize(&info.title).trim_end_matches('.'), job.video.id));
-        progress(0.2, translate("Downloading…"));
+        progress(0.1, translate("Downloading…"));
         let mut cmd = Command::new(&ff);
         cmd.args(["-y", "-i", hls_url, "-c", "copy", "-movflags", "+faststart"])
             .arg(&out)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        hide_window(&mut cmd);
-        if cmd.status().map(|s| s.success()).unwrap_or(false) {
+        if run_and_poll(cmd, child_pid, cancel)? {
             return Ok(out.to_string_lossy().into_owned());
         }
+        let _ = std::fs::remove_file(&out);
     }
-    native_download(job, dir, cancel, progress)
+    native_download_info(job, &info, dir, headers, cancel, progress)
 }
 
-/// Without yt-dlp: progressive (muxed) stream or audio-only stream.
-fn native_download(job: &Job, dir: &std::path::Path, cancel: &AtomicBool, progress: &dyn Fn(f32, &str)) -> anyhow::Result<String> {
-    let info = streams::get_streams(&job.video.id)?;
+/// Without FFmpeg merge: parallel chunked download of progressive (muxed) or audio-only stream.
+fn native_download_info(
+    job: &Job,
+    info: &crate::api::types::StreamInfo,
+    dir: &std::path::Path,
+    headers: &[(&str, &str)],
+    cancel: &AtomicBool,
+    progress: &(dyn Fn(f32, &str) + Send + Sync),
+) -> anyhow::Result<String> {
     let (fmt, ext) = if job.format == "audio" {
         let a = info.audio.iter().find(|a| a.mime.contains("mp4")).or(info.audio.first()).ok_or_else(|| anyhow::anyhow!("no audio stream"))?;
         (a.clone(), if a.mime.contains("mp4") { "m4a" } else { "webm" })
     } else {
-        let m = info.muxed.iter().max_by_key(|m| m.height).ok_or_else(|| anyhow::anyhow!("no combined stream (install yt-dlp for high quality downloads)"))?;
+        let m = info.muxed.iter().max_by_key(|m| m.height).ok_or_else(|| anyhow::anyhow!("no combined stream available"))?;
         (m.clone(), "mp4")
     };
-    let path = dir.join(format!("{} [{}].{ext}", sanitize(&info.title), job.video.id));
-    let mut f = std::fs::File::create(&path)?;
-    crate::api::http::download_to(&fmt.url, &mut f, |done, total| {
-        let p = total.map(|t| done as f32 / t as f32).unwrap_or(0.0);
-        progress(p, &format!("{:.1} MB", done as f64 / 1e6));
-        !cancel.load(Ordering::SeqCst)
-    })?;
+    let path = dir.join(format!("{} [{}].{ext}", sanitize(&info.title).trim_end_matches('.'), job.video.id));
+    let tracker = PartProgress::new(fmt.content_length);
+    if let Some(tot) = fmt.content_length {
+        progress(0.0, &format!("0% • 0 B / {}", format_bytes(tot)));
+    }
+    let res = crate::api::http::download_chunked_to(&fmt.url, &path, fmt.content_length, headers, cancel, |done, tot| {
+        tracker.report(done, tot, progress);
+    });
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
     Ok(path.to_string_lossy().into_owned())
 }
 
 pub fn cancel(id: u64, cx: &mut App) {
-    if let Some(j) = cx.default_global::<Downloads>().jobs.lock().iter().find(|j| j.id == id) {
-        j.cancel.store(true, Ordering::SeqCst);
+    let mut kill_pid = 0u32;
+    {
+        let mut jobs = cx.default_global::<Downloads>().jobs.lock();
+        if let Some(j) = jobs.iter_mut().find(|j| j.id == id) {
+            j.cancel.store(true, Ordering::SeqCst);
+            kill_pid = j.child_pid.swap(0, Ordering::SeqCst);
+            if matches!(j.status, JobStatus::Queued | JobStatus::Running) {
+                j.status = JobStatus::Cancelled;
+                j.detail = translate("Cancelled").to_string();
+            }
+        }
     }
+    if kill_pid != 0 {
+        kill_process_tree(kill_pid);
+    }
+    save_history(cx);
+    cx.refresh_windows();
 }
 
 pub fn open_external(id: &str, cx: &mut App) {
@@ -809,27 +1038,153 @@ fn save_history(cx: &mut App) {
     }
 }
 
-/// Loads the saved download list at startup.
-pub fn load_history(cx: &mut App) {
-    let Some(raw) = store::kv_get(HISTORY_KEY) else { return };
-    let Ok(saved) = serde_json::from_str::<Vec<Saved>>(&raw) else { return };
-    let d = cx.default_global::<Downloads>();
-    let mut jobs = d.jobs.lock();
-    for s in saved {
-        d.next += 1;
+fn thumbs_dir() -> std::path::PathBuf {
+    store::data_dir().join("dl_thumbs")
+}
+
+/// Local cached thumbnail path for offline display if present on disk.
+pub fn local_thumb_path(video_id: &str) -> Option<std::path::PathBuf> {
+    if video_id.is_empty() {
+        return None;
+    }
+    let p = thumbs_dir().join(format!("{video_id}.jpg"));
+    p.is_file().then_some(p)
+}
+
+fn cache_thumb_bg(video_id: &str, url: &str) {
+    if video_id.is_empty() || url.is_empty() {
+        return;
+    }
+    let dest = thumbs_dir().join(format!("{video_id}.jpg"));
+    if dest.is_file() {
+        return;
+    }
+    let url = url.to_string();
+    std::thread::spawn(move || {
+        let _ = std::fs::create_dir_all(dest.parent().unwrap());
+        if let Ok(bytes) = crate::api::http::get_bytes(&url, &[]) {
+            if !bytes.is_empty() {
+                let _ = std::fs::write(&dest, &bytes);
+            }
+        }
+    });
+}
+
+fn parse_downloaded_filename(stem: &str) -> (String, String) {
+    if let Some(open) = stem.rfind('[') {
+        if let Some(close) = stem[open..].find(']') {
+            let id = stem[open + 1..open + close].trim();
+            if id.len() == 11 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                let title = stem[..open].trim().to_string();
+                return (if title.is_empty() { id.to_string() } else { title }, id.to_string());
+            }
+        }
+    }
+    (stem.to_string(), String::new())
+}
+
+fn merge_local_dir_files(jobs: &mut Vec<Job>, next_id: &mut u64, dir: &std::path::Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut existing_paths: std::collections::HashSet<String> = jobs
+        .iter()
+        .filter_map(|j| match &j.status {
+            JobStatus::Done(p) => Some(p.to_lowercase()),
+            _ => None,
+        })
+        .collect();
+    let mut found: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name.ends_with(".part") || name.ends_with(".tmp") {
+            continue;
+        }
+        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+        if !matches!(ext.as_str(), "mp4" | "mkv" | "webm" | "m4a" | "mp3" | "opus") {
+            continue;
+        }
+        let key = p.to_string_lossy().to_lowercase();
+        if existing_paths.contains(&key) {
+            continue;
+        }
+        let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+        found.push((mtime, p));
+    }
+    // Sort oldest -> newest so rev() rendering puts newest downloads first
+    found.sort_by_key(|(t, _)| *t);
+    for (_, p) in found {
+        let path_str = p.to_string_lossy().into_owned();
+        if !existing_paths.insert(path_str.to_lowercase()) {
+            continue;
+        }
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("Downloaded video");
+        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("mp4").to_string();
+        let (title, vid) = parse_downloaded_filename(stem);
+        let thumbnail = if vid.is_empty() { String::new() } else { crate::api::innertube::default_thumb(&vid) };
+        *next_id += 1;
         jobs.push(Job {
-            id: d.next,
-            video: s.video,
-            format: s.format,
-            status: match (s.path, s.error) {
-                (Some(p), _) => JobStatus::Done(p),
-                (None, e) => JobStatus::Failed(e.unwrap_or_default()),
+            id: *next_id,
+            video: VideoItem {
+                id: vid,
+                title,
+                thumbnail,
+                ..Default::default()
             },
+            format: ext,
+            status: JobStatus::Done(path_str),
             progress: 1.0,
             detail: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
+            child_pid: Arc::new(AtomicU32::new(0)),
         });
     }
+}
+
+/// Loads the saved download list at startup and scans the download folder so
+/// downloaded files always appear even when launched offline.
+pub fn load_history(cx: &mut App) {
+    let saved = store::kv_get(HISTORY_KEY)
+        .and_then(|raw| serde_json::from_str::<Vec<Saved>>(&raw).ok())
+        .unwrap_or_default();
+    let dir = std::path::PathBuf::from({
+        let d = store::settings_snapshot().download_dir;
+        if d.is_empty() { ".".into() } else { d }
+    });
+    let d = cx.default_global::<Downloads>();
+    {
+        let mut jobs = d.jobs.lock();
+        for s in saved {
+            d.next += 1;
+            jobs.push(Job {
+                id: d.next,
+                video: s.video,
+                format: s.format,
+                status: match (s.path, s.error) {
+                    (Some(p), _) => JobStatus::Done(p),
+                    (None, e) => JobStatus::Failed(e.unwrap_or_default()),
+                },
+                progress: 1.0,
+                detail: String::new(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                child_pid: Arc::new(AtomicU32::new(0)),
+            });
+        }
+        merge_local_dir_files(&mut jobs, &mut d.next, &dir);
+    }
+}
+
+/// Refreshes local media files from `download_dir` (useful when offline).
+pub fn sync_local_files(cx: &mut App) {
+    let dir = std::path::PathBuf::from({
+        let d = store::settings_snapshot().download_dir;
+        if d.is_empty() { ".".into() } else { d }
+    });
+    let d = cx.default_global::<Downloads>();
+    let mut jobs = d.jobs.lock();
+    merge_local_dir_files(&mut jobs, &mut d.next, &dir);
 }
 
 // ── FFmpeg (joins separate video and audio streams) ──
@@ -1094,7 +1449,7 @@ mod fetch_tests {
 
 #[cfg(test)]
 mod kids_download_tests {
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
     /// A video made for kids downloads from the iOS HLS manifest when yt-dlp gets no formats.
     /// network + yt-dlp: cargo test kids_download -- --ignored
     #[::core::prelude::v1::test]
@@ -1106,15 +1461,16 @@ mod kids_download_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let s = crate::store::settings_snapshot();
         let cancel = AtomicBool::new(false);
+        let pid = AtomicU32::new(0);
         let url = "https://www.youtube.com/watch?v=e_04ZrNroTo";
         let fmt = "bv*[height<=360]+ba/b[height<=360]/b";
         // yt-dlp alone fails, with an error that leads to the retries
-        if let Err(e) = super::ytdlp_run(&bin, &dir, url, fmt, &s, &["--extractor-args", super::YTDLP_IOS], None, false, &cancel, &|_, _| {}) {
+        if let Err(e) = super::ytdlp_run(&bin, &dir, url, fmt, &s, &["--extractor-args", super::YTDLP_IOS], None, false, &cancel, &pid, &|_, _| {}) {
             println!("yt-dlp iOS: {e}");
         }
         let manifest = crate::api::streams::ios_hls_manifest("e_04ZrNroTo").unwrap();
         let name = format!("{} [e_04ZrNroTo]", super::sanitize("Kids: test / video?").replace('%', "%%"));
-        let path = super::ytdlp_run(&bin, &dir, &manifest, fmt, &s, &[], Some(&name), false, &cancel, &|p, d| println!("{p:.2} {d}")).unwrap();
+        let path = super::ytdlp_run(&bin, &dir, &manifest, fmt, &s, &[], Some(&name), false, &cancel, &pid, &|p, d| println!("{p:.2} {d}")).unwrap();
         println!("{path}");
         assert!(path.contains("e_04ZrNroTo"));
         assert!(std::fs::metadata(&path).unwrap().len() > 1_000_000);
@@ -1127,5 +1483,17 @@ mod kids_download_tests {
         assert!(!super::retry_with_ios("cancelled"));
         let f = super::hls_format_for("1080");
         assert!(f.contains("bv*[protocol^=m3u8][height<=1080]+ba[protocol^=m3u8]"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn formats_live_progress_and_filenames() {
+        let (pct, msg) = super::format_dl_progress(50_000_000, Some(200_000_000), 10_000_000.0);
+        assert!((pct - 0.25).abs() < 0.001);
+        assert!(msg.contains("25%"));
+        assert!(msg.contains("200.0 MB"));
+        assert!(msg.contains("10.0 MB/s"));
+        let (title, id) = super::parse_downloaded_filename("My Cool Video [dQw4w9WgXcQ]");
+        assert_eq!(title, "My Cool Video");
+        assert_eq!(id, "dQw4w9WgXcQ");
     }
 }

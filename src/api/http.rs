@@ -65,6 +65,16 @@ fn agent() -> ureq::Agent {
     })
 }
 
+fn download_agent() -> ureq::Agent {
+    static AGENT: NetworkAgent = NetworkAgent::new();
+    AGENT.get(&crate::store::settings_snapshot(), |builder| {
+        builder
+            .timeout_global(Some(Duration::from_secs(300)))
+            .http_status_as_error(false)
+            .user_agent(BROWSER_UA)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{IpFamily, NetworkAgent};
@@ -165,7 +175,7 @@ pub fn download_to(
     out: &mut dyn std::io::Write,
     mut progress: impl FnMut(u64, Option<u64>) -> bool,
 ) -> Result<()> {
-    let mut resp = agent().get(url).call()?;
+    let mut resp = download_agent().get(url).call()?;
     if resp.status().as_u16() >= 400 {
         return Err(anyhow!("HTTP {}", resp.status()));
     }
@@ -175,7 +185,7 @@ pub fn download_to(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok());
     let mut reader = resp.body_mut().with_config().limit(u64::MAX).reader();
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut buf = vec![0u8; 64 * 1024];
     let mut done = 0u64;
     loop {
         let n = reader.read(&mut buf)?;
@@ -189,6 +199,209 @@ pub fn download_to(
         }
     }
     Ok(())
+}
+
+fn write_all_at(file: &std::fs::File, mut offset: u64, mut data: &[u8]) -> std::io::Result<()> {
+    while !data.is_empty() {
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_write(file, data, offset)?;
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::write_at(file, data, offset)?;
+        #[cfg(not(any(windows, unix)))]
+        let n = {
+            let _ = (&file, &offset);
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "positional write unsupported"));
+        };
+        if n == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write zero"));
+        }
+        offset += n as u64;
+        data = &data[n..];
+    }
+    Ok(())
+}
+
+fn probe_content_length(url: &str, headers: &[(&str, &str)]) -> Option<u64> {
+    let mut req = download_agent().get(url).header("Range", "bytes=0-0");
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let resp = req.call().ok()?;
+    if resp.status().as_u16() == 206 {
+        if let Some(cr) = resp.headers().get("content-range").and_then(|v| v.to_str().ok()) {
+            if let Some(total) = cr.rsplit('/').next().and_then(|s| s.trim().parse::<u64>().ok()) {
+                return Some(total);
+            }
+        }
+    }
+    if resp.status().as_u16() < 400 {
+        return resp
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 1);
+    }
+    None
+}
+
+/// High-speed multi-connection Range chunked download to a file on disk.
+/// Splits large streams into 2 MB chunks downloaded in parallel (up to 8 connections),
+/// falling back cleanly to a single stream if Range isn't supported or file is small.
+pub fn download_chunked_to(
+    url: &str,
+    path: &std::path::Path,
+    known_len: Option<u64>,
+    headers: &[(&str, &str)],
+    cancel: &std::sync::atomic::AtomicBool,
+    progress: impl Fn(u64, Option<u64>) + Send + Sync,
+) -> Result<u64> {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    const CHUNK_SIZE: u64 = 2 * 1024 * 1024;
+    const WORKERS: usize = 8;
+
+    let total = known_len.filter(|&n| n > 0).or_else(|| probe_content_length(url, headers));
+    if let Some(total) = total.filter(|&n| n >= CHUNK_SIZE) {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        file.set_len(total)?;
+        let mut ranges = Vec::new();
+        let mut start = 0u64;
+        while start < total {
+            let end = (start + CHUNK_SIZE - 1).min(total - 1);
+            ranges.push((start, end));
+            start = end + 1;
+        }
+        let next_idx = AtomicUsize::new(0);
+        let downloaded = AtomicU64::new(0);
+        let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        let n_workers = WORKERS.min(ranges.len());
+        progress(0, Some(total));
+        std::thread::scope(|scope| {
+            for _ in 0..n_workers {
+                scope.spawn(|| {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    loop {
+                        if cancel.load(Ordering::Relaxed) || first_err.lock().is_some() {
+                            break;
+                        }
+                        let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(r_start, r_end)) = ranges.get(idx) else { break };
+                        let mut attempt = 0;
+                        let chunk_res: Result<()> = loop {
+                            if cancel.load(Ordering::Relaxed) {
+                                break Err(anyhow!("cancelled"));
+                            }
+                            let res = (|| -> Result<()> {
+                                let mut req = download_agent()
+                                    .get(url)
+                                    .header("Range", &format!("bytes={r_start}-{r_end}"));
+                                for (k, v) in headers {
+                                    req = req.header(*k, *v);
+                                }
+                                let mut resp = req.call()?;
+                                let status = resp.status().as_u16();
+                                if status >= 400 {
+                                    return Err(anyhow!("HTTP {status}"));
+                                }
+                                if status != 206 {
+                                    return Err(anyhow!("range unsupported (HTTP {status})"));
+                                }
+                                let mut reader = resp.body_mut().with_config().limit(u64::MAX).reader();
+                                let mut pos = r_start;
+                                let expected = r_end - r_start + 1;
+                                let mut got = 0u64;
+                                while got < expected {
+                                    if cancel.load(Ordering::Relaxed) {
+                                        return Err(anyhow!("cancelled"));
+                                    }
+                                    let max_read = ((expected - got) as usize).min(buf.len());
+                                    let n = reader.read(&mut buf[..max_read])?;
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    write_all_at(&file, pos, &buf[..n])?;
+                                    pos += n as u64;
+                                    got += n as u64;
+                                    let cur = downloaded.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+                                    progress(cur.min(total), Some(total));
+                                }
+                                if got < expected {
+                                    return Err(anyhow!("incomplete chunk ({got}/{expected})"));
+                                }
+                                Ok(())
+                            })();
+                            match res {
+                                Ok(()) => break Ok(()),
+                                Err(_) if cancel.load(Ordering::Relaxed) => break Err(anyhow!("cancelled")),
+                                Err(e) if e.to_string().contains("range unsupported") => break Err(e),
+                                Err(_) if attempt < 2 => {
+                                    attempt += 1;
+                                    std::thread::sleep(Duration::from_millis(150 * attempt as u64));
+                                }
+                                Err(e) => break Err(e),
+                            }
+                        };
+                        if let Err(e) = chunk_res {
+                            let mut err_slot = first_err.lock();
+                            if err_slot.is_none() {
+                                *err_slot = Some(e);
+                            }
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow!("cancelled"));
+        }
+        if let Some(err) = first_err.into_inner() {
+            if !err.to_string().contains("range unsupported") {
+                return Err(err);
+            }
+        } else {
+            return Ok(total);
+        }
+    }
+
+    // Fallback single-connection streaming download (unknown length, < 2 MB, or server rejected Range)
+    let mut req = download_agent().get(url);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let mut resp = req.call()?;
+    if resp.status().as_u16() >= 400 {
+        return Err(anyhow!("HTTP {}", resp.status()));
+    }
+    let cl = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .or(total);
+    let mut file = std::fs::File::create(path)?;
+    let mut reader = resp.body_mut().with_config().limit(u64::MAX).reader();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut done = 0u64;
+    use std::io::Write;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow!("cancelled"));
+        }
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])?;
+        done += n as u64;
+        progress(done, cl);
+    }
+    Ok(done)
 }
 
 pub fn urlencode(s: &str) -> String {

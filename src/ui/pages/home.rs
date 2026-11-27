@@ -534,7 +534,19 @@ impl Render for HomePage {
         };
         let body: AnyElement = match &self.items {
             Load::Loading => message(spinner(cx).into_any_element()),
-            Load::Error(e) => message(error_state(e, cx).into_any_element()),
+            Load::Error(e) => message(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_4()
+                    .child(error_state(e, cx))
+                    .child(
+                        pill("home-downloads", Some("download"), "Open Downloads", cx)
+                            .on_click(|_, window, cx| crate::ui::app::navigate(crate::ui::app::Route::Downloads, window, cx)),
+                    )
+                    .into_any_element(),
+            ),
             Load::Ready(items) => {
                 let items = items.clone();
                 let mut rows = feed_rows(&items, &s, columns, width, rem, cx);
