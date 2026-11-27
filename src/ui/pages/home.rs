@@ -43,26 +43,6 @@ fn feed_source() -> &'static str {
     }
 }
 
-/// The home feed from the last session, shown at once when the app starts while
-/// the new one loads. Kept for three days.
-fn cached_home() -> Option<Vec<Item>> {
-    let v: serde_json::Value = serde_json::from_str(&store::kv_get("home_cache")?).ok()?;
-    if v.get("source")?.as_str()? != feed_source() || crate::api::json::now() - v.get("at")?.as_i64()? > 3 * 24 * 3600 {
-        return None;
-    }
-    let items: Vec<Item> = serde_json::from_value(v.get("items")?.clone()).ok()?;
-    (!items.is_empty()).then_some(items)
-}
-
-fn save_home(items: &[Item]) {
-    let v = serde_json::json!({
-        "source": feed_source(),
-        "at": crate::api::json::now(),
-        "items": items.iter().take(60).collect::<Vec<_>>(),
-    });
-    store::kv_set("home_cache", &v.to_string());
-}
-
 /// The "Recently uploaded" chip (after All and the Explore categories).
 const RECENT: usize = usize::MAX;
 /// How far back "Recently uploaded" reaches.
@@ -128,9 +108,6 @@ fn recently_uploaded() -> anyhow::Result<Vec<Item>> {
         })
         .collect())
 }
-
-/// Only the first home load of a session starts from the cache.
-static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Clone)]
 struct HomeCacheEntry {
@@ -269,109 +246,105 @@ impl HomePage {
         self.serial += 1;
         let serial = self.serial;
         let chip = self.chip;
-        // at startup, show the last feed right away instead of a spinner
-        let mut from_cache = false;
-        if chip == 0 && !STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            if let Some(items) = cached_home() {
-                self.items = Load::Ready(Arc::new(items));
-                from_cache = true;
-            }
-        }
         cx.spawn(async move |this, cx| {
             let res = blocking(move || -> anyhow::Result<(Vec<Item>, Option<String>)> {
-                if chip == 0 && crate::api::web::connected() {
-                    // the account's home feed exactly as youtube.com builds it
-                    for _ in 0..2 {
-                        match crate::api::web::home() {
-                            Ok(p) if !p.items.is_empty() => return Ok((freshen(p.items), p.continuation.map(|c| format!("{WEB}{c}")))),
-                            _ => std::thread::sleep(std::time::Duration::from_millis(400)),
-                        }
-                    }
-                }
-                if chip == 0 && crate::api::auth::signed_in() {
-                    // YouTube's own recommendations for the account (a failed request is
-                    // retried once before falling back, so the feed stays personal)
-                    let home = crate::api::auth::home().ok().filter(|p| !p.items.is_empty()).or_else(|| {
-                        std::thread::sleep(std::time::Duration::from_millis(400));
-                        crate::api::auth::home().ok()
-                    });
-                    if let Some(p) = home {
-                        if !p.items.is_empty() {
-                            // shown as soon as the first page is in; the next page loads
-                            // when scrolling, instead of making the start wait for it
-                            return Ok((freshen(p.items), p.continuation.map(|c| format!("{ACCOUNT}{c}"))));
-                        }
-                    }
-                }
-                if chip == 0 && crate::recommend::available() {
-                    // no account: videos related to what was watched and searched here,
-                    // with new uploads from local subscriptions mixed in
-                    let mut picks = crate::recommend::for_you();
-                    if !picks.is_empty() {
-                        if !store::subscriptions().is_empty() {
-                            let (feed, _) = crate::feed::cached_feed(None);
-                            let mut subs = feed.into_iter().take(30).map(Item::Video);
-                            let mut out = Vec::new();
-                            for (i, it) in picks.drain(..).enumerate() {
-                                out.push(it);
-                                if i % 3 == 2 {
-                                    out.extend(subs.next());
-                                }
+                let mut out = (|| -> anyhow::Result<(Vec<Item>, Option<String>)> {
+                    if chip == 0 && crate::api::web::connected() {
+                        // the account's home feed exactly as youtube.com builds it
+                        for _ in 0..2 {
+                            match crate::api::web::home() {
+                                Ok(p) if !p.items.is_empty() => return Ok((freshen(p.items), p.continuation.map(|c| format!("{WEB}{c}")))),
+                                _ => std::thread::sleep(std::time::Duration::from_millis(400)),
                             }
-                            picks = out;
                         }
-                        return Ok((freshen(picks), None));
                     }
-                }
-                if chip == RECENT {
-                    return Ok((recently_uploaded()?, None));
-                }
-                if chip == 0 {
-                    let subs = store::subscriptions();
-                    if !subs.is_empty() {
-                        let (mut feed, oldest) = crate::feed::cached_feed(None);
-                        let stale = oldest.map(|o| crate::api::json::now() - o > 3600).unwrap_or(true);
-                        if feed.is_empty() || stale {
-                            feed = crate::feed::refresh(None, |_, _| {}).0;
+                    if chip == 0 && crate::api::auth::signed_in() {
+                        // YouTube's own recommendations for the account (a failed request is
+                        // retried once before falling back, so the feed stays personal)
+                        let home = crate::api::auth::home().ok().filter(|p| !p.items.is_empty()).or_else(|| {
+                            std::thread::sleep(std::time::Duration::from_millis(400));
+                            crate::api::auth::home().ok()
+                        });
+                        if let Some(p) = home {
+                            if !p.items.is_empty() {
+                                // shown as soon as the first page is in; the next page loads
+                                // when scrolling, instead of making the start wait for it
+                                return Ok((freshen(p.items), p.continuation.map(|c| format!("{ACCOUNT}{c}"))));
+                            }
                         }
-                        // only the subscriptions: popular videos from unrelated channels mixed
-                        // in here read as random videos in the feed
-                        let items: Vec<Item> = feed.into_iter().take(80).map(Item::Video).collect();
-                        return Ok((freshen(items), None));
                     }
-                    // no subscriptions: popular from several categories, interleaved
-                    let lists: Vec<Vec<Item>> = std::thread::scope(|s| {
-                        let hs: Vec<_> = EXPLORE
-                            .iter()
-                            .take(4)
-                            .map(|(_, id)| s.spawn(move || innertube::explore(id).map(|p| p.items).unwrap_or_default()))
-                            .collect();
-                        hs.into_iter().map(|h| h.join().unwrap_or_default()).collect()
-                    });
-                    let mut out = Vec::new();
-                    let mut iters: Vec<_> = lists.into_iter().map(|l| l.into_iter().filter(|i| matches!(i, Item::Video(_)))).collect();
-                    let mut seen = std::collections::HashSet::new();
-                    loop {
-                        let mut any = false;
-                        for it in iters.iter_mut() {
-                            if let Some(x) = it.next() {
-                                any = true;
-                                if let Item::Video(v) = &x {
-                                    if seen.insert(v.id.clone()) {
-                                        out.push(x);
+                    if chip == 0 && crate::recommend::available() {
+                        // no account: videos related to what was watched and searched here,
+                        // with new uploads from local subscriptions mixed in
+                        let mut picks = crate::recommend::for_you();
+                        if !picks.is_empty() {
+                            if !store::subscriptions().is_empty() {
+                                let (feed, _) = crate::feed::cached_feed(None);
+                                let mut subs = feed.into_iter().take(30).map(Item::Video);
+                                let mut out = Vec::new();
+                                for (i, it) in picks.drain(..).enumerate() {
+                                    out.push(it);
+                                    if i % 3 == 2 {
+                                        out.extend(subs.next());
+                                    }
+                                }
+                                picks = out;
+                            }
+                            return Ok((freshen(picks), None));
+                        }
+                    }
+                    if chip == RECENT {
+                        return Ok((recently_uploaded()?, None));
+                    }
+                    if chip == 0 {
+                        let subs = store::subscriptions();
+                        if !subs.is_empty() {
+                            let (mut feed, oldest) = crate::feed::cached_feed(None);
+                            let stale = oldest.map(|o| crate::api::json::now() - o > 3600).unwrap_or(true);
+                            if feed.is_empty() || stale {
+                                feed = crate::feed::refresh(None, |_, _| {}).0;
+                            }
+                            // only the subscriptions: popular videos from unrelated channels mixed
+                            // in here read as random videos in the feed
+                            let items: Vec<Item> = feed.into_iter().take(80).map(Item::Video).collect();
+                            return Ok((freshen(items), None));
+                        }
+                        // no subscriptions: popular from several categories, interleaved
+                        let lists: Vec<Vec<Item>> = std::thread::scope(|s| {
+                            let hs: Vec<_> = EXPLORE
+                                .iter()
+                                .take(4)
+                                .map(|(_, id)| s.spawn(move || innertube::explore(id).map(|p| p.items).unwrap_or_default()))
+                                .collect();
+                            hs.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+                        });
+                        let mut out = Vec::new();
+                        let mut iters: Vec<_> = lists.into_iter().map(|l| l.into_iter().filter(|i| matches!(i, Item::Video(_)))).collect();
+                        let mut seen = std::collections::HashSet::new();
+                        loop {
+                            let mut any = false;
+                            for it in iters.iter_mut() {
+                                if let Some(x) = it.next() {
+                                    any = true;
+                                    if let Item::Video(v) = &x {
+                                        if seen.insert(v.id.clone()) {
+                                            out.push(x);
+                                        }
                                     }
                                 }
                             }
+                            if !any {
+                                break;
+                            }
                         }
-                        if !any {
-                            break;
-                        }
+                        Ok((freshen(out), None))
+                    } else {
+                        let p = innertube::explore(EXPLORE[chip - 1].1)?;
+                        Ok((p.items, p.continuation))
                     }
-                    Ok((freshen(out), None))
-                } else {
-                    let p = innertube::explore(EXPLORE[chip - 1].1)?;
-                    Ok((p.items, p.continuation))
-                }
+                })()?;
+                crate::api::auth::fill_avatars_items(&mut out.0);
+                Ok(out)
             })
             .await;
             let _ = this.update(cx, |this, cx| {
@@ -381,21 +354,11 @@ impl HomePage {
                 crate::perf::mark("home feed fetched");
                 match res {
                     Ok((items, cont)) => {
-                        if chip == 0 && !items.is_empty() {
-                            save_home(&items);
-                        }
                         let items = Arc::new(items);
-                        // the cached feed stays if the user is already scrolling through it
-                        let scrolled = this.scroll.scroll_px_offset_for_scrollbar().y < px(-40.);
-                        if !(from_cache && scrolled) {
-                            this.items = Load::Ready(items.clone());
-                            HOME_CACHE.lock().insert(chip, HomeCacheEntry { items, continuation: cont.clone() });
-                        } else if let Some(cur) = this.items.ready() {
-                            HOME_CACHE.lock().insert(chip, HomeCacheEntry { items: cur.clone(), continuation: cont.clone() });
-                        }
+                        this.items = Load::Ready(items.clone());
+                        HOME_CACHE.lock().insert(chip, HomeCacheEntry { items, continuation: cont.clone() });
                         this.continuation = cont;
                     }
-                    Err(_) if from_cache => {}
                     Err(e) => this.items = Load::Error(e.to_string()),
                 }
                 cx.notify();
@@ -413,19 +376,22 @@ impl HomePage {
         let serial = self.serial;
         cx.spawn(async move |this, cx| {
             let res = blocking(move || {
-                if let Some(t) = tok.strip_prefix(WEB) {
-                    return crate::api::web::browse_continue(t).map(|mut p| {
+                let mut page = if let Some(t) = tok.strip_prefix(WEB) {
+                    crate::api::web::browse_continue(t).map(|mut p| {
                         p.continuation = p.continuation.map(|c| format!("{WEB}{c}"));
                         p
-                    });
-                }
-                match tok.strip_prefix(ACCOUNT) {
-                    Some(t) => crate::api::auth::browse_continue(t).map(|mut p| {
-                        p.continuation = p.continuation.map(|c| format!("{ACCOUNT}{c}"));
-                        p
-                    }),
-                    None => innertube::browse_continue(&tok),
-                }
+                    })?
+                } else {
+                    match tok.strip_prefix(ACCOUNT) {
+                        Some(t) => crate::api::auth::browse_continue(t).map(|mut p| {
+                            p.continuation = p.continuation.map(|c| format!("{ACCOUNT}{c}"));
+                            p
+                        })?,
+                        None => innertube::browse_continue(&tok)?,
+                    }
+                };
+                crate::api::auth::fill_avatars_items(&mut page.items);
+                Ok::<_, anyhow::Error>(page)
             })
             .await;
             let _ = this.update(cx, |this, cx| {

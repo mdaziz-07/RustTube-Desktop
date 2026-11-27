@@ -366,11 +366,17 @@ fn parse_lockup(l: &Value) -> Option<Item> {
     if channel_id.is_none() {
         channel_id = meta
             .pointer("/image/decoratedAvatarViewModel/rendererContext/commandContext/onTap/innertubeCommand/browseEndpoint/browseId")
+            .or_else(|| meta.pointer("/image/avatarViewModel/rendererContext/commandContext/onTap/innertubeCommand/browseEndpoint/browseId"))
             .and_then(Value::as_str)
             .map(str::to_string);
     }
     let avatar = meta
         .pointer("/image/decoratedAvatarViewModel/avatar/avatarViewModel/image")
+        .or_else(|| meta.pointer("/image/avatarViewModel/image"))
+        .or_else(|| meta.pointer("/image/decoratedAvatarViewModel/avatar/image"))
+        .or_else(|| meta.pointer("/image/avatarStackViewModel/avatars/0/avatarViewModel/image"))
+        .or_else(|| meta.pointer("/image/thumbnail"))
+        .or_else(|| l.pointer("/channelThumbnailSupportedRenderers/channelThumbnailWithLinkRenderer/thumbnail"))
         .and_then(small_thumb);
     if channel_id.is_none() {
         // TV lockups keep the channel link in the long-press menu
@@ -870,7 +876,13 @@ pub fn channel_avatar(channel_id: &str) -> Result<Option<String>> {
         .or_else(|| {
             r.pointer("/header/pageHeaderRenderer/content/pageHeaderViewModel/image/decoratedAvatarViewModel/avatar/avatarViewModel/image")
                 .and_then(small_thumb)
-        }))
+        })
+        .or_else(|| {
+            r.pointer("/header/pageHeaderRenderer/content/pageHeaderViewModel/image/avatarViewModel/image")
+                .and_then(small_thumb)
+        })
+        .or_else(|| r.pointer("/header/c4TabbedHeaderRenderer/avatar").and_then(small_thumb))
+        .or_else(|| r.pointer("/microformat/microformatDataRenderer/thumbnail").and_then(small_thumb)))
 }
 
 /// Finds a channel by its exact display name: (channel id, avatar).

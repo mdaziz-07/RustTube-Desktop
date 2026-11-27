@@ -260,6 +260,7 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
+#[allow(dead_code)]
 fn hls_format_for(spec: &str) -> String {
     match spec {
         "audio" => "bestaudio[protocol^=m3u8]/bestaudio".to_string(),
@@ -364,7 +365,7 @@ fn run_job(job: &Job, cancel: &AtomicBool, child_pid: &AtomicU32, progress: &(dy
     let dir = std::path::PathBuf::from(if s.download_dir.is_empty() { ".".into() } else { s.download_dir.clone() });
     std::fs::create_dir_all(&dir)?;
 
-    // Fast path: resolve direct Innertube streams (~200 ms) and download with 8 parallel Range chunks.
+    // Fast path: Stream Tube's PO-token-free HLS parallel downloader or multi-chunk Range downloader.
     match streams_download(job, &dir, cancel, child_pid, progress) {
         Ok(path) => return Ok(path),
         Err(e) if cancel.load(Ordering::SeqCst) || e.to_string() == "cancelled" => return Err(anyhow::anyhow!("cancelled")),
@@ -377,36 +378,26 @@ fn run_job(job: &Job, cancel: &AtomicBool, child_pid: &AtomicU32, progress: &(dy
                     "best" => "bv*+ba/b".to_string(),
                     h => format!("bv*[height<={h}]+ba/b[height<={h}]/b"),
                 };
-                let mut res = ytdlp_run(&bin, &dir, &url, &fmt, &s, &[], None, true, cancel, child_pid, progress);
-                if let Err(e) = &res {
-                    if e.to_string().contains("403") && !cancel.load(Ordering::SeqCst) {
-                        progress(0.0, translate("Retrying…"));
-                        let hls = format!("{}/{}", hls_format_for(&job.format), fmt);
-                        res = ytdlp_run(&bin, &dir, &url, &hls, &s, &[], None, true, cancel, child_pid, progress);
+                if !retry_with_ios(&direct_err.to_string()) {
+                    let res = ytdlp_run(&bin, &dir, &url, &fmt, &s, &[], None, true, true, cancel, child_pid, progress);
+                    if res.is_ok() || cancel.load(Ordering::SeqCst) {
+                        return res;
                     }
                 }
-                if let Err(e) = &res {
-                    if retry_with_ios(&e.to_string()) && !cancel.load(Ordering::SeqCst) {
-                        for args in [&["--extractor-args", YTDLP_IOS][..], &["--extractor-args", "youtube:player_client=android_vr"][..]] {
-                            if cancel.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            progress(0.0, translate("Retrying…"));
-                            res = ytdlp_run(&bin, &dir, &url, &fmt, &s, args, None, false, cancel, child_pid, progress);
-                            if res.is_ok() || cancel.load(Ordering::SeqCst) {
-                                break;
-                            }
-                        }
-                        if res.is_err() && !cancel.load(Ordering::SeqCst) {
-                            if let Ok(manifest) = streams::ios_hls_manifest(&job.video.id) {
-                                let m_fmt = if job.format == "single" { "bv*+ba/b".to_string() } else { fmt.clone() };
-                                let name = format!("{} [{}]", sanitize(&job.video.title).trim_end_matches('.').replace('%', "%%"), job.video.id);
-                                res = ytdlp_run(&bin, &dir, &manifest, &m_fmt, &s, &[], Some(&name), false, cancel, child_pid, progress);
-                            }
-                        }
+                progress(0.0, translate("Retrying…"));
+                if let Ok(manifest) = streams::ios_hls_manifest(&job.video.id) {
+                    let m_fmt = if job.format == "single" { "bv*+ba/b".to_string() } else { fmt.clone() };
+                    let name = format!("{} [{}]", sanitize(&job.video.title).trim_end_matches('.').replace('%', "%%"), job.video.id);
+                    let res = ytdlp_run(&bin, &dir, &manifest, &m_fmt, &s, &[], Some(&name), false, false, cancel, child_pid, progress);
+                    if res.is_ok() || cancel.load(Ordering::SeqCst) {
+                        return res;
                     }
                 }
-                return res;
+                let res = ytdlp_run(&bin, &dir, &url, &fmt, &s, &["--extractor-args", YTDLP_IOS], None, false, false, cancel, child_pid, progress);
+                if res.is_ok() || cancel.load(Ordering::SeqCst) {
+                    return res;
+                }
+                return ytdlp_run(&bin, &dir, &url, &fmt, &s, &["--extractor-args", "youtube:player_client=android_vr"], None, false, false, cancel, child_pid, progress);
             }
             Err(direct_err)
         }
@@ -451,6 +442,7 @@ fn ytdlp_run(
     extra: &[&str],
     name: Option<&str>,
     use_cookies: bool,
+    announce_start: bool,
     cancel: &AtomicBool,
     child_pid: &AtomicU32,
     progress: &(dyn Fn(f32, &str) + Send + Sync),
@@ -492,7 +484,9 @@ fn ytdlp_run(
         let mut child = cmd.spawn()?;
         let pid = child.id();
         child_pid.store(pid, Ordering::SeqCst);
-        progress(0.0, translate("Starting download…"));
+        if announce_start {
+            progress(0.0, translate("Starting download…"));
+        }
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let err_reader = std::thread::spawn(move || {
@@ -621,8 +615,222 @@ impl PartProgress {
     }
 }
 
-/// Downloads via Stream Tube's own fast Innertube resolver + 8-connection Range chunked transfer
-/// (+ FFmpeg remux when separate high-resolution video & audio streams are returned).
+fn parse_hls_master_selection(master_url: &str, selected: &str) -> (Option<(String, u64)>, Option<String>) {
+    let lines: Vec<&str> = selected.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let mut video: Option<(String, u64)> = None;
+    let mut audio: Option<String> = None;
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i];
+        if l.starts_with("#EXT-X-MEDIA") && crate::player::proxy::hls_attr(l, "TYPE").as_deref() == Some("AUDIO") {
+            if let Some(uri) = crate::player::proxy::hls_attr(l, "URI") {
+                if let Some(u) = crate::player::proxy::playlist_url(master_url, &uri) {
+                    audio = Some(u);
+                }
+            }
+        } else if l.starts_with("#EXT-X-STREAM-INF") {
+            let bw = crate::player::proxy::hls_attr(l, "BANDWIDTH").and_then(|b| b.parse::<u64>().ok()).unwrap_or(0);
+            if let Some(uri) = lines.get(i + 1).filter(|u| !u.starts_with('#')) {
+                if let Some(u) = crate::player::proxy::playlist_url(master_url, uri) {
+                    video = Some((u, bw));
+                }
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    (video, audio)
+}
+
+fn parse_hls_media_playlist(playlist_url: &str, text: &str) -> anyhow::Result<(Vec<String>, f64)> {
+    let mut segments = Vec::new();
+    let mut duration = 0.0f64;
+    for raw in text.lines() {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with("#EXT-X-KEY") && !t.contains("METHOD=NONE") {
+            anyhow::bail!("encrypted HLS stream");
+        }
+        if t.starts_with("#EXT-X-MAP") {
+            if let Some(uri) = crate::player::proxy::hls_attr(t, "URI") {
+                if let Some(u) = crate::player::proxy::playlist_url(playlist_url, &uri) {
+                    segments.push(u);
+                }
+            }
+        } else if let Some(rest) = t.strip_prefix("#EXTINF:") {
+            if let Some(d) = rest.split(',').next().and_then(|s| s.trim().parse::<f64>().ok()) {
+                duration += d;
+            }
+        } else if !t.starts_with('#') {
+            if let Some(u) = crate::player::proxy::playlist_url(playlist_url, t) {
+                segments.push(u);
+            }
+        }
+    }
+    Ok((segments, duration))
+}
+
+/// Fast 8-connection native HLS downloader for PO-token-free visionOS / iOS streams.
+fn hls_download(
+    job: &Job,
+    info: &crate::api::types::StreamInfo,
+    hls_url: &str,
+    ff: &str,
+    dir: &std::path::Path,
+    cancel: &AtomicBool,
+    child_pid: &AtomicU32,
+    progress: &(dyn Fn(f32, &str) + Send + Sync),
+) -> anyhow::Result<String> {
+    let ua_hdr = &[("User-Agent", crate::api::http::BROWSER_UA)];
+    let max_height: u32 = match job.format.as_str() {
+        "best" => 4320,
+        "single" => 720,
+        "audio" => 144,
+        h => h.parse().unwrap_or(1080),
+    };
+    let master_bytes = crate::api::http::get_bytes(hls_url, ua_hdr)?;
+    let master_text = String::from_utf8_lossy(&master_bytes);
+    let selected = crate::player::proxy::select_master(&master_text, max_height, None)
+        .ok_or_else(|| anyhow::anyhow!("no matching HLS variant"))?;
+    let (video_sel, audio_url) = parse_hls_master_selection(hls_url, &selected);
+    let audio_only = job.format == "audio";
+    if audio_only && audio_url.is_none() {
+        anyhow::bail!("no separate HLS audio stream");
+    }
+    if !audio_only && video_sel.is_none() {
+        anyhow::bail!("no HLS video playlist");
+    }
+
+    let (v_segs, v_dur, v_bw, a_segs, a_dur) = std::thread::scope(|s| -> anyhow::Result<_> {
+        let vh = (!audio_only).then(|| {
+            let (u, bw) = video_sel.clone().unwrap();
+            s.spawn(move || {
+                let raw = crate::api::http::get_bytes(&u, ua_hdr)?;
+                let (segs, dur) = parse_hls_media_playlist(&u, &String::from_utf8_lossy(&raw))?;
+                Ok::<_, anyhow::Error>((segs, dur, bw))
+            })
+        });
+        let ah = audio_url.as_ref().map(|u| {
+            let u = u.clone();
+            s.spawn(move || {
+                let raw = crate::api::http::get_bytes(&u, ua_hdr)?;
+                parse_hls_media_playlist(&u, &String::from_utf8_lossy(&raw))
+            })
+        });
+        let (v_segs, v_dur, v_bw) = match vh {
+            Some(h) => h.join().map_err(|_| anyhow::anyhow!("HLS playlist thread panicked"))??,
+            None => (Vec::new(), 0.0, 0),
+        };
+        let (a_segs, a_dur) = match ah {
+            Some(h) => h.join().map_err(|_| anyhow::anyhow!("HLS audio thread panicked"))??,
+            None => (Vec::new(), 0.0),
+        };
+        Ok((v_segs, v_dur, v_bw, a_segs, a_dur))
+    })?;
+
+    let base = format!("{} [{}]", sanitize(&info.title).trim_end_matches('.'), job.video.id);
+    let v_tmp = dir.join(format!("{base}.hls.video.part"));
+    let a_tmp = dir.join(format!("{base}.hls.audio.part"));
+    let ext = if audio_only { "m4a" } else { "mp4" };
+    let out = dir.join(format!("{base}.{ext}"));
+    let cleanup = || {
+        let _ = std::fs::remove_file(&v_tmp);
+        let _ = std::fs::remove_file(&a_tmp);
+    };
+
+    let dur = v_dur.max(a_dur).max(1.0);
+    let est_a_init = if a_segs.is_empty() { 0 } else { ((128_000.0 / 8.0) * dur) as u64 };
+    let est_v_init = if v_segs.is_empty() { 0 } else { ((v_bw.max(800_000) as f64 / 8.0) * dur) as u64 };
+    let mut tracker = PartProgress::new(None);
+    if est_v_init + est_a_init > 0 {
+        progress(0.0, &format!("0% • 0 B / ~{}", format_bytes(est_v_init + est_a_init)));
+    }
+
+    let mut v_bytes = 0u64;
+    if !audio_only {
+        let nv = v_segs.len().max(1);
+        let res = crate::api::http::download_hls_segments_to(&v_segs, &v_tmp, ua_hdr, cancel, |done, segs| {
+            let est_v = if segs >= 2 {
+                (((done as f64 / segs as f64) * nv as f64) as u64).max(done)
+            } else {
+                est_v_init.max(done)
+            };
+            tracker.report(done, Some(est_v + est_a_init), progress);
+        });
+        v_bytes = match res {
+            Ok(n) => n,
+            Err(e) => {
+                cleanup();
+                return Err(e);
+            }
+        };
+    }
+
+    if cancel.load(Ordering::SeqCst) {
+        cleanup();
+        anyhow::bail!("cancelled");
+    }
+
+    if !a_segs.is_empty() {
+        tracker.base_done = v_bytes;
+        let na = a_segs.len().max(1);
+        if let Err(e) = crate::api::http::download_hls_segments_to(&a_segs, &a_tmp, ua_hdr, cancel, |done, segs| {
+            let est_a = if segs >= 2 {
+                (((done as f64 / segs as f64) * na as f64) as u64).max(done)
+            } else {
+                est_a_init.max(done)
+            };
+            tracker.report(done, Some(est_a), progress);
+        }) {
+            cleanup();
+            return Err(e);
+        }
+    }
+
+    if cancel.load(Ordering::SeqCst) {
+        cleanup();
+        anyhow::bail!("cancelled");
+    }
+
+    progress(0.99, translate("Finishing…"));
+    let mut cmd = Command::new(ff);
+    if audio_only {
+        cmd.args(["-y", "-i"])
+            .arg(&a_tmp)
+            .args(["-vn", "-c:a", "copy", "-movflags", "+faststart"])
+            .arg(&out);
+    } else if !a_segs.is_empty() {
+        cmd.args(["-y", "-i"])
+            .arg(&v_tmp)
+            .arg("-i")
+            .arg(&a_tmp)
+            .args(["-c", "copy", "-movflags", "+faststart"])
+            .arg(&out);
+    } else {
+        cmd.args(["-y", "-i"])
+            .arg(&v_tmp)
+            .args(["-c", "copy", "-movflags", "+faststart"])
+            .arg(&out);
+    }
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    let ok = run_and_poll(cmd, child_pid, cancel).inspect_err(|_| {
+        cleanup();
+        let _ = std::fs::remove_file(&out);
+    })?;
+    cleanup();
+    if ok {
+        Ok(out.to_string_lossy().into_owned())
+    } else {
+        let _ = std::fs::remove_file(&out);
+        anyhow::bail!("FFmpeg failed to remux HLS download")
+    }
+}
+
+/// Downloads via Stream Tube's own PO-token-free HLS parallel downloader (or 8-connection
+/// Range chunked direct transfer as fallback).
 fn streams_download(
     job: &Job,
     dir: &std::path::Path,
@@ -631,7 +839,22 @@ fn streams_download(
     progress: &(dyn Fn(f32, &str) + Send + Sync),
 ) -> anyhow::Result<String> {
     progress(0.0, translate("Connecting…"));
-    let info = streams::direct_streams(&job.video.id)?;
+    let ff_opt = ffmpeg_path();
+    let stream_info = streams::get_streams(&job.video.id);
+    if let Ok(ref info) = stream_info {
+        if let (Some(hls_url), Some(ff)) = (info.hls_url.as_deref(), ff_opt.as_deref()) {
+            match hls_download(job, info, hls_url, ff, dir, cancel, child_pid, progress) {
+                Ok(path) => return Ok(path),
+                Err(e) if cancel.load(Ordering::SeqCst) || e.to_string() == "cancelled" => return Err(anyhow::anyhow!("cancelled")),
+                Err(_) => {}
+            }
+        }
+    }
+
+    let info = match stream_info {
+        Ok(i) if !i.hls_only && (!i.video.is_empty() || !i.muxed.is_empty() || !i.audio.is_empty()) => i,
+        _ => streams::direct_streams(&job.video.id)?,
+    };
     let headers: &[(&str, &str)] = if info.source == "innertube" {
         &[("User-Agent", streams::DIRECT_UA)]
     } else {
@@ -645,7 +868,7 @@ fn streams_download(
         h => h.parse().unwrap_or(1080),
     };
     let (v, a) = streams::pick_formats(&info, target_q, "h264", None);
-    let Some(ff) = ffmpeg_path() else {
+    let Some(ff) = ff_opt else {
         return native_download_info(job, &info, dir, headers, cancel, progress);
     };
     if let (Some(v), Some(a)) = (v, a) {
@@ -708,19 +931,6 @@ fn streams_download(
         }
         let _ = std::fs::remove_file(&out);
         anyhow::bail!("FFmpeg failed to merge video and audio");
-    }
-    if let Some(hls_url) = info.hls_url.as_deref() {
-        let out = dir.join(format!("{} [{}].mp4", sanitize(&info.title).trim_end_matches('.'), job.video.id));
-        progress(0.1, translate("Downloading…"));
-        let mut cmd = Command::new(&ff);
-        cmd.args(["-y", "-i", hls_url, "-c", "copy", "-movflags", "+faststart"])
-            .arg(&out)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if run_and_poll(cmd, child_pid, cancel)? {
-            return Ok(out.to_string_lossy().into_owned());
-        }
-        let _ = std::fs::remove_file(&out);
     }
     native_download_info(job, &info, dir, headers, cancel, progress)
 }
@@ -1464,12 +1674,12 @@ mod kids_download_tests {
         let url = "https://www.youtube.com/watch?v=e_04ZrNroTo";
         let fmt = "bv*[height<=360]+ba/b[height<=360]/b";
         // yt-dlp alone fails, with an error that leads to the retries
-        if let Err(e) = super::ytdlp_run(&bin, &dir, url, fmt, &s, &["--extractor-args", super::YTDLP_IOS], None, false, &cancel, &pid, &|_, _| {}) {
+        if let Err(e) = super::ytdlp_run(&bin, &dir, url, fmt, &s, &["--extractor-args", super::YTDLP_IOS], None, false, false, &cancel, &pid, &|_, _| {}) {
             println!("yt-dlp iOS: {e}");
         }
         let manifest = crate::api::streams::ios_hls_manifest("e_04ZrNroTo").unwrap();
         let name = format!("{} [e_04ZrNroTo]", super::sanitize("Kids: test / video?").replace('%', "%%"));
-        let path = super::ytdlp_run(&bin, &dir, &manifest, fmt, &s, &[], Some(&name), false, &cancel, &pid, &|p, d| println!("{p:.2} {d}")).unwrap();
+        let path = super::ytdlp_run(&bin, &dir, &manifest, fmt, &s, &[], Some(&name), false, false, &cancel, &pid, &|p, d| println!("{p:.2} {d}")).unwrap();
         println!("{path}");
         assert!(path.contains("e_04ZrNroTo"));
         assert!(std::fs::metadata(&path).unwrap().len() > 1_000_000);
@@ -1494,5 +1704,38 @@ mod kids_download_tests {
         let (title, id) = super::parse_downloaded_filename("My Cool Video [dQw4w9WgXcQ]");
         assert_eq!(title, "My Cool Video");
         assert_eq!(id, "dQw4w9WgXcQ");
+    }
+
+    #[::core::prelude::v1::test]
+    fn parses_hls_master_and_media_playlists() {
+        let master = "\
+#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a1\",NAME=\"English\",DEFAULT=YES,URI=\"https://cdn.example/audio.m3u8\"
+#EXT-X-STREAM-INF:BANDWIDTH=2450000,RESOLUTION=1920x1080,AUDIO=\"a1\"
+https://cdn.example/video.m3u8
+";
+        let (v, a) = super::parse_hls_master_selection("https://cdn.example/master.m3u8", master);
+        assert_eq!(v, Some(("https://cdn.example/video.m3u8".into(), 2_450_000)));
+        assert_eq!(a, Some("https://cdn.example/audio.m3u8".into()));
+
+        let media = "\
+#EXTM3U
+#EXT-X-MAP:URI=\"init.mp4\"
+#EXTINF:5.000,
+seg1.m4s
+#EXTINF:4.500,
+seg2.m4s
+#EXT-X-ENDLIST
+";
+        let (segs, dur) = super::parse_hls_media_playlist("https://cdn.example/dir/video.m3u8", media).unwrap();
+        assert_eq!(
+            segs,
+            vec![
+                "https://cdn.example/dir/init.mp4".to_string(),
+                "https://cdn.example/dir/seg1.m4s".to_string(),
+                "https://cdn.example/dir/seg2.m4s".to_string(),
+            ]
+        );
+        assert!((dur - 9.5).abs() < 0.01);
     }
 }

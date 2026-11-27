@@ -82,7 +82,7 @@ type LoadResult = Result<Arc<RenderImage>, ImageCacheError>;
 
 enum Own {
     Loading(HashSet<EntityId>),
-    Done(LoadResult),
+    Done(LoadResult, Option<std::time::Instant>),
 }
 
 enum Slot {
@@ -97,9 +97,16 @@ impl Slot {
         match self {
             Slot::Gpui(i) => i.get(),
             Slot::Web { state, .. } => match &*state.borrow() {
-                Own::Done(r) => Some(r.clone()),
+                Own::Done(r, _) => Some(r.clone()),
                 Own::Loading(_) => None,
             },
+        }
+    }
+
+    fn failed_stale(&self) -> bool {
+        match self {
+            Slot::Web { state, .. } => matches!(&*state.borrow(), Own::Done(Err(_), Some(at)) if at.elapsed() > std::time::Duration::from_secs(6)),
+            Slot::Gpui(_) => false,
         }
     }
 
@@ -107,7 +114,7 @@ impl Slot {
         match self {
             Slot::Gpui(i) => i.use_image(window),
             Slot::Web { state, .. } => match &mut *state.borrow_mut() {
-                Own::Done(r) => Some(r.clone()),
+                Own::Done(r, _) => Some(r.clone()),
                 Own::Loading(views) => {
                     views.insert(window.current_view());
                     None
@@ -125,8 +132,9 @@ impl Slot {
         let weak = Rc::downgrade(&state);
         let task = cx.spawn(async move |cx| {
             let result = fetch_in_background(url).await.map_err(|e| ImageCacheError::Other(Arc::new(e)));
+            let failed_at = result.is_err().then(std::time::Instant::now);
             let Some(state) = weak.upgrade() else { return };
-            let prev = std::mem::replace(&mut *state.borrow_mut(), Own::Done(result));
+            let prev = std::mem::replace(&mut *state.borrow_mut(), Own::Done(result, failed_at));
             if let Own::Loading(views) = prev {
                 cx.update(|cx| {
                     for v in views {
@@ -166,7 +174,26 @@ async fn fetch_in_background(url: String) -> anyhow::Result<Arc<RenderImage>> {
 
 /// Downloads an image and decodes it (BGRA, like gpui), shrinking oversized ones.
 fn fetch_decode(url: &str) -> anyhow::Result<Arc<RenderImage>> {
-    let bytes = crate::api::http::get_bytes(url, &[])?;
+    let mut last_err = None;
+    let mut bytes = None;
+    for attempt in 0..3u64 {
+        match crate::api::http::get_bytes(url, &[]) {
+            Ok(b) => {
+                bytes = Some(b);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(150 * (attempt + 1)));
+                }
+            }
+        }
+    }
+    let bytes = match bytes {
+        Some(b) => b,
+        None => return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("image fetch failed"))),
+    };
     if let Some(frames) = animated(&bytes) {
         return Ok(Arc::new(RenderImage::new(frames)));
     }
@@ -310,6 +337,9 @@ impl ImageCache for LruImageCache {
         self.tick += 1;
         let (g, t) = (self.gen_, self.tick);
         let e = self.items.entry(key(resource)).or_insert_with(|| Entry { item: Slot::new(resource, cx), used_gen: g, used_tick: t, bytes: 0 });
+        if e.item.failed_stale() {
+            e.item = Slot::new(resource, cx);
+        }
         e.used_gen = g;
         e.used_tick = t;
         let r = e.item.use_image(window);

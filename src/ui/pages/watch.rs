@@ -1938,11 +1938,11 @@ impl Render for WatchPage {
             return div().size_full().bg(black()).child(crate::ui::slot::player_slot(cx)).into_any_element();
         }
         let vp = ui.viewport;
-        let avail = vp.width - px(48.);
+        let avail = vp.width - px(32.);
         let s = store::settings_snapshot();
-        let side_w = px((s.related_thumb_width + 234.0).clamp(402.0, 540.0));
+        let side_w = px((s.related_thumb_width + 196.0).clamp(360.0, 480.0));
         let two_col = avail > px(1000.);
-        let primary_w = if two_col { (avail - side_w - px(24.)).min(px(1280.)) } else { avail };
+        let primary_w = if two_col { (avail - side_w - px(20.)).min(px(1600.)) } else { avail };
         let player_h = if theater {
             (vp.width * (9. / 16.)).min(vp.height - px(56. + 120.))
         } else {
@@ -2001,8 +2001,8 @@ impl Render for WatchPage {
                 .child(
                     div()
                         .flex()
-                        .gap_6()
-                        .px_6()
+                        .gap_5()
+                        .px_4()
                         .pb_24()
                         .when(!two_col, |d| d.flex_col())
                         .child(div().w(primary_w).flex_none().child(primary_info))
@@ -2012,8 +2012,8 @@ impl Render for WatchPage {
             div()
                 .flex()
                 .justify_center()
-                .gap_6()
-                .px_6()
+                .gap_5()
+                .px_4()
                 .pt_6()
                 .pb_24()
                 .when(!two_col, |d| d.flex_col())

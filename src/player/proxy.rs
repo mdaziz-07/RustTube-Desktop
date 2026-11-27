@@ -124,7 +124,7 @@ pub fn local_pass(url: &str) -> String {
     format!("{}/p/{id}", p.base())
 }
 
-pub(super) fn hls_attr(line: &str, key: &str) -> Option<String> {
+pub(crate) fn hls_attr(line: &str, key: &str) -> Option<String> {
     // match KEY= at an attribute boundary (so AUDIO= doesn't hit "VIDEO-RANGE=..."-like names)
     let mut search = line;
     loop {
@@ -145,7 +145,7 @@ pub(super) fn hls_attr(line: &str, key: &str) -> Option<String> {
 /// `max_height` and the codec preference) plus its default audio rendition.
 /// ffmpeg opens every playlist a master lists before starting, so serving the
 /// full master (often 30+ playlists) delays the start by many seconds.
-pub(super) fn select_master(text: &str, max_height: u32, audio_name: Option<&str>) -> Option<String> {
+pub(crate) fn select_master(text: &str, max_height: u32, audio_name: Option<&str>) -> Option<String> {
     let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     let mut header = Vec::new();
     let mut medias = Vec::new();
@@ -283,7 +283,7 @@ fn rewrite_playlist(p: &Proxy, base: &str, text: &str, max_height: u32) -> Strin
     out
 }
 
-pub(super) fn playlist_url(base: &str, uri: &str) -> Option<String> {
+pub(crate) fn playlist_url(base: &str, uri: &str) -> Option<String> {
     if uri.starts_with("https://") || uri.starts_with("http://") {
         return Some(uri.to_owned());
     }

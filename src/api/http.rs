@@ -404,6 +404,146 @@ pub fn download_chunked_to(
     Ok(done)
 }
 
+/// Downloads ordered HLS media segments across up to 8 parallel connections and concatenates
+/// them sequentially into `out_path`, reporting `(bytes_downloaded, segments_completed)`.
+pub fn download_hls_segments_to(
+    urls: &[String],
+    out_path: &std::path::Path,
+    headers: &[(&str, &str)],
+    cancel: &std::sync::atomic::AtomicBool,
+    progress: impl Fn(u64, usize) + Send + Sync,
+) -> Result<u64> {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    if urls.is_empty() {
+        return Err(anyhow!("no HLS segments"));
+    }
+    struct SegDirGuard(std::path::PathBuf);
+    impl Drop for SegDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let seg_dir = out_path.with_file_name(format!(
+        ".{}.segs",
+        out_path.file_name().and_then(|n| n.to_str()).unwrap_or("hls")
+    ));
+    let _ = std::fs::remove_dir_all(&seg_dir);
+    std::fs::create_dir_all(&seg_dir)?;
+    let _guard = SegDirGuard(seg_dir.clone());
+
+    let total_segs = urls.len();
+    let next = AtomicUsize::new(0);
+    let bytes_done = AtomicU64::new(0);
+    let segs_done = AtomicUsize::new(0);
+    let err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+    let workers = total_segs.min(8);
+
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                if cancel.load(Ordering::Relaxed) || err.lock().unwrap().is_some() {
+                    break;
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= total_segs {
+                    break;
+                }
+                let seg_path = seg_dir.join(format!("seg_{i:06}.part"));
+                let mut seg_err: Option<anyhow::Error> = None;
+                for attempt in 0..3u64 {
+                    if cancel.load(Ordering::Relaxed) {
+                        seg_err = Some(anyhow!("cancelled"));
+                        break;
+                    }
+                    let mut wrote_attempt = 0u64;
+                    let attempt_res = (|| -> Result<()> {
+                        let mut req = download_agent().get(&urls[i]);
+                        for (k, v) in headers {
+                            req = req.header(*k, *v);
+                        }
+                        let mut resp = req.call()?;
+                        if resp.status().as_u16() >= 400 {
+                            return Err(anyhow!("HTTP {}", resp.status()));
+                        }
+                        let file = std::fs::File::create(&seg_path)?;
+                        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
+                        let mut reader = resp.body_mut().with_config().limit(256 * 1024 * 1024).reader();
+                        let mut buf = [0u8; 64 * 1024];
+                        loop {
+                            if cancel.load(Ordering::Relaxed) {
+                                return Err(anyhow!("cancelled"));
+                            }
+                            let n = reader.read(&mut buf)?;
+                            if n == 0 {
+                                break;
+                            }
+                            writer.write_all(&buf[..n])?;
+                            wrote_attempt += n as u64;
+                            let cur_bytes = bytes_done.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+                            progress(cur_bytes, segs_done.load(Ordering::Relaxed));
+                        }
+                        writer.flush()?;
+                        Ok(())
+                    })();
+                    match attempt_res {
+                        Ok(()) => {
+                            let cur_segs = segs_done.fetch_add(1, Ordering::Relaxed) + 1;
+                            progress(bytes_done.load(Ordering::Relaxed), cur_segs);
+                            seg_err = None;
+                            break;
+                        }
+                        Err(e) => {
+                            if wrote_attempt > 0 {
+                                bytes_done.fetch_sub(wrote_attempt, Ordering::Relaxed);
+                            }
+                            let _ = std::fs::remove_file(&seg_path);
+                            let cancelled = cancel.load(Ordering::Relaxed) || e.to_string() == "cancelled";
+                            seg_err = Some(e);
+                            if cancelled || attempt == 2 {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(150 * (attempt + 1)));
+                        }
+                    }
+                }
+                if let Some(e) = seg_err {
+                    let mut g = err.lock().unwrap();
+                    if g.is_none() {
+                        *g = Some(e);
+                    }
+                    break;
+                }
+            });
+        }
+    });
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err(anyhow!("cancelled"));
+    }
+    if let Some(e) = err.into_inner().unwrap() {
+        return Err(e);
+    }
+
+    let out_file = std::fs::File::create(out_path)?;
+    let mut out_writer = std::io::BufWriter::with_capacity(256 * 1024, out_file);
+    let mut total_written = 0u64;
+    for i in 0..total_segs {
+        if cancel.load(Ordering::Relaxed) {
+            drop(out_writer);
+            let _ = std::fs::remove_file(out_path);
+            return Err(anyhow!("cancelled"));
+        }
+        let seg_path = seg_dir.join(format!("seg_{i:06}.part"));
+        let mut src = std::fs::File::open(&seg_path)?;
+        total_written += std::io::copy(&mut src, &mut out_writer)?;
+        drop(src);
+        let _ = std::fs::remove_file(&seg_path);
+    }
+    out_writer.flush()?;
+    Ok(total_written)
+}
+
 pub fn urlencode(s: &str) -> String {
     let mut o = String::with_capacity(s.len() * 3);
     for b in s.bytes() {

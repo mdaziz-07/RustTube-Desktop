@@ -145,9 +145,9 @@ pub fn small_thumb(v: &Value) -> Option<String> {
         .get("thumbnails")
         .or_else(|| v.get("sources"))
         .and_then(Value::as_array)?;
-    arr.first()
-        .and_then(|t| t.get("url"))
-        .and_then(Value::as_str)
+    arr.iter()
+        .filter_map(|t| t.get("url").and_then(Value::as_str).map(str::trim).filter(|u| !u.is_empty()))
+        .next()
         .map(fix_url)
 }
 

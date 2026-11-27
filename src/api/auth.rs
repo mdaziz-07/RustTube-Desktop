@@ -235,26 +235,31 @@ fn name_key(n: &str) -> String {
     format!("name:{}", n.trim().to_lowercase())
 }
 
-fn fill_avatars(page: &mut Page) {
+pub(crate) fn fill_avatars_items(items: &mut [Item]) {
     let cache = avatar_cache();
     // what still needs a lookup: by id when we have one, otherwise by name
     let (by_id, by_name): (Vec<String>, Vec<String>) = {
         let mut c = cache.lock();
         for s in crate::store::subscriptions() {
-            if let Some(a) = s.avatar {
+            if let Some(a) = s.avatar.filter(|u| !u.is_empty()) {
                 c.entry(format!("id:{}", s.channel_id)).or_insert_with(|| a.clone());
                 c.entry(name_key(&s.name)).or_insert(format!("{}|{a}", s.channel_id));
             }
         }
         let (mut by_id, mut by_name) = (Vec::new(), Vec::new());
-        for it in &page.items {
+        for it in items.iter() {
             let Item::Video(v) = it else { continue };
-            match (&v.channel_id, &v.channel_avatar) {
-                (Some(id), Some(a)) => {
-                    c.entry(format!("id:{id}")).or_insert_with(|| a.clone());
+            let has_avatar = v.channel_avatar.as_deref().is_some_and(|u| !u.is_empty());
+            match (&v.channel_id, has_avatar) {
+                (Some(id), true) => {
+                    if let Some(a) = v.channel_avatar.as_deref().filter(|u| !u.is_empty()) {
+                        c.entry(format!("id:{id}")).or_insert_with(|| a.to_string());
+                    }
                 }
-                (Some(id), None) if !c.contains_key(&format!("id:{id}")) && !by_id.contains(id) => by_id.push(id.clone()),
-                (None, _) if !v.channel_name.is_empty() && !c.contains_key(&name_key(&v.channel_name)) && !by_name.contains(&v.channel_name) => {
+                (Some(id), false) if !c.contains_key(&format!("id:{id}")) && !by_id.contains(id) && by_id.len() < 24 => {
+                    by_id.push(id.clone())
+                }
+                (None, false) if !v.channel_name.is_empty() && !c.contains_key(&name_key(&v.channel_name)) && !by_name.contains(&v.channel_name) && by_id.len() + by_name.len() < 24 => {
                     by_name.push(v.channel_name.clone())
                 }
                 _ => {}
@@ -267,12 +272,17 @@ fn fill_avatars(page: &mut Page) {
             let mut handles = Vec::new();
             for id in &by_id {
                 handles.push(s.spawn(move || {
-                    crate::api::innertube::channel_avatar(id).ok().flatten().map(|a| vec![(format!("id:{id}"), a)]).unwrap_or_default()
+                    crate::api::innertube::channel_avatar(id)
+                        .ok()
+                        .flatten()
+                        .filter(|a| !a.is_empty())
+                        .map(|a| vec![(format!("id:{id}"), a)])
+                        .unwrap_or_default()
                 }));
             }
             for name in &by_name {
                 handles.push(s.spawn(move || match crate::api::innertube::channel_by_name(name) {
-                    Ok(Some((id, Some(a)))) => vec![(name_key(name), format!("{id}|{a}")), (format!("id:{id}"), a)],
+                    Ok(Some((id, Some(a)))) if !a.is_empty() => vec![(name_key(name), format!("{id}|{a}")), (format!("id:{id}"), a)],
                     // remember misses too, so the same name isn't searched on every load
                     Ok(_) => vec![(name_key(name), String::new())],
                     Err(_) => vec![],
@@ -296,18 +306,24 @@ fn fill_avatars(page: &mut Page) {
         }
     }
     let c = cache.lock();
-    for it in page.items.iter_mut() {
+    for it in items.iter_mut() {
         let Item::Video(v) = it else { continue };
-        if v.channel_avatar.is_some() {
+        if v.channel_avatar.as_deref().is_some_and(|u| !u.is_empty()) {
             continue;
         }
         if let Some(id) = &v.channel_id {
-            v.channel_avatar = c.get(&format!("id:{id}")).cloned();
+            v.channel_avatar = c.get(&format!("id:{id}")).filter(|u| !u.is_empty()).cloned();
         } else if let Some((id, a)) = c.get(&name_key(&v.channel_name)).and_then(|e| e.split_once('|')) {
-            v.channel_id = Some(id.to_string());
-            v.channel_avatar = Some(a.to_string());
+            if !a.is_empty() {
+                v.channel_id = Some(id.to_string());
+                v.channel_avatar = Some(a.to_string());
+            }
         }
     }
+}
+
+fn fill_avatars(page: &mut Page) {
+    fill_avatars_items(&mut page.items);
 }
 
 /// Videos only, deduplicated, in feed order, with channel avatars filled in.
