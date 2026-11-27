@@ -1143,16 +1143,18 @@ fn merge_local_dir_files(jobs: &mut Vec<Job>, next_id: &mut u64, dir: &std::path
     }
 }
 
+fn configured_download_dir() -> std::path::PathBuf {
+    let s = store::settings_snapshot();
+    std::path::PathBuf::from(if s.download_dir.is_empty() { "." } else { s.download_dir.as_str() })
+}
+
 /// Loads the saved download list at startup and scans the download folder so
 /// downloaded files always appear even when launched offline.
 pub fn load_history(cx: &mut App) {
     let saved = store::kv_get(HISTORY_KEY)
         .and_then(|raw| serde_json::from_str::<Vec<Saved>>(&raw).ok())
         .unwrap_or_default();
-    let dir = std::path::PathBuf::from({
-        let d = store::settings_snapshot().download_dir;
-        if d.is_empty() { ".".into() } else { d }
-    });
+    let dir = configured_download_dir();
     let d = cx.default_global::<Downloads>();
     {
         let mut jobs = d.jobs.lock();
@@ -1178,10 +1180,7 @@ pub fn load_history(cx: &mut App) {
 
 /// Refreshes local media files from `download_dir` (useful when offline).
 pub fn sync_local_files(cx: &mut App) {
-    let dir = std::path::PathBuf::from({
-        let d = store::settings_snapshot().download_dir;
-        if d.is_empty() { ".".into() } else { d }
-    });
+    let dir = configured_download_dir();
     let d = cx.default_global::<Downloads>();
     let mut jobs = d.jobs.lock();
     merge_local_dir_files(&mut jobs, &mut d.next, &dir);
